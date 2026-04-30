@@ -16,3 +16,5 @@ lxml
 websockets
 pywin32
 psutil
+akshare
+chinese-calendar

@@ -415,12 +415,32 @@ async def _do_digest(min_messages: int = 0) -> dict:
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT id, conv_id, role, content, created_at FROM messages "
+            "SELECT id, conv_id, role, content, attachments, created_at FROM messages "
             "WHERE role IN ('user','assistant') AND created_at > ? "
             "ORDER BY created_at ASC",
             (anchor_ts,)
         )
         new_msgs = [dict(r) for r in await cur.fetchall()]
+
+    # 语音消息：将转写文本注入 content，记忆总结使用纯文本
+    for m in new_msgs:
+        att_raw = m.pop("attachments", None)
+        if att_raw and m["role"] == "user":
+            try:
+                atts = json.loads(att_raw) if isinstance(att_raw, str) else (att_raw or [])
+            except Exception:
+                atts = []
+            for att in atts:
+                if isinstance(att, dict) and att.get("type") == "voice":
+                    transcript = att.get("transcript", "")
+                    if transcript:
+                        orig = m["content"].strip() if m["content"] else ""
+                        m["content"] = f"[语音消息] {transcript}" + (f"\n{orig}" if orig else "")
+                elif isinstance(att, dict) and att.get("type") == "video_clip":
+                    transcript = att.get("transcript", "")
+                    if transcript:
+                        orig = m["content"].strip() if m["content"] else ""
+                        m["content"] = f"[视频通话] {transcript}" + (f"\n{orig}" if orig else "")
 
     if not new_msgs:
         return {"ok": True, "message": "当前没有新增内容需要总结", "new_memories_count": 0, "processed_messages": 0}

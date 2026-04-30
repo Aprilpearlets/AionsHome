@@ -622,7 +622,24 @@ call_core判断依据：
             history = []
             for r in reversed(rows):
                 d = dict(r)
-                # 哨兵唤醒 Core 时不携带历史图片，只带文本上下文
+                # 语音消息：将转写文本注入 content
+                raw_atts = d.get("attachments", "")
+                try:
+                    atts = json.loads(raw_atts) if raw_atts else []
+                except Exception:
+                    atts = []
+                for att in atts:
+                    if isinstance(att, dict) and att.get("type") == "voice":
+                        transcript = att.get("transcript", "")
+                        if transcript:
+                            orig = d["content"].strip() if d["content"] else ""
+                            d["content"] = f"[语音消息] {transcript}" + (f"\n{orig}" if orig else "")
+                    elif isinstance(att, dict) and att.get("type") == "video_clip":
+                        transcript = att.get("transcript", "")
+                        if transcript:
+                            orig = d["content"].strip() if d["content"] else ""
+                            d["content"] = f"[视频通话] {transcript}" + (f"\n{orig}" if orig else "")
+                # 哨兵唤醒 Core 时不携带历史图片/音频，只带文本上下文
                 d["attachments"] = []
                 history.append(d)
 
@@ -807,7 +824,24 @@ async def perform_cam_check(conv_id: str, model_key: str):
     recent = []
     for r in reversed(rows):
         d = dict(r)
-        # Core 主动查看监控时不携带历史图片，只带文本上下文
+        # 语音消息：将转写文本注入 content
+        raw_atts = d.get("attachments", "")
+        try:
+            atts = json.loads(raw_atts) if raw_atts else []
+        except Exception:
+            atts = []
+        for att in atts:
+            if isinstance(att, dict) and att.get("type") == "voice":
+                transcript = att.get("transcript", "")
+                if transcript:
+                    orig = d["content"].strip() if d["content"] else ""
+                    d["content"] = f"[语音消息] {transcript}" + (f"\n{orig}" if orig else "")
+            elif isinstance(att, dict) and att.get("type") == "video_clip":
+                transcript = att.get("transcript", "")
+                if transcript:
+                    orig = d["content"].strip() if d["content"] else ""
+                    d["content"] = f"[视频通话] {transcript}" + (f"\n{orig}" if orig else "")
+        # Core 主动查看监控时不携带历史图片/音频，只带文本上下文
         d["attachments"] = []
         recent.append(d)
 

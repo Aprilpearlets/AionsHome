@@ -1,4 +1,4 @@
-﻿package com.aion.chat;
+package com.aion.chat;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
@@ -13,7 +13,11 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.provider.Settings;
+import android.content.ContentValues;
+import android.provider.MediaStore;
+import android.util.Base64;
 import android.webkit.ConsoleMessage;
+import android.webkit.JavascriptInterface;
 import android.webkit.PermissionRequest;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -93,13 +97,43 @@ public class WebViewActivity extends AppCompatActivity {
         setContentView(webView);
 
         // 原生麦克风桥接（绕过 getUserMedia 的 HTTPS 限制）
-        webView.addJavascriptInterface(new AudioBridge(webView), "AionAudio");
+        AudioBridge audioBridge = new AudioBridge(webView);
+        webView.addJavascriptInterface(audioBridge, "AionAudio");
 
         // 原生摄像头桥接（绕过 getUserMedia 的 HTTPS 限制）
-        webView.addJavascriptInterface(new CameraBridge(webView), "AionCamera");
+        CameraBridge cameraBridge = new CameraBridge(webView);
+        webView.addJavascriptInterface(cameraBridge, "AionCamera");
+
+        // 原生视频录制桥接（复用摄像头+麦克风帧，MediaCodec+MediaMuxer 编码 MP4）
+        VideoBridge videoBridge = new VideoBridge(webView, getCacheDir());
+        audioBridge.setVideoBridge(videoBridge);
+        cameraBridge.setVideoBridge(videoBridge);
+        webView.addJavascriptInterface(videoBridge, "AionVideo");
 
         // 原生 BLE 桥接（绕过 WebView 不支持 Web Bluetooth API 的限制）
         webView.addJavascriptInterface(new BleBridge(webView, this), "AionBle");
+
+        // 图片保存桥接（WebView 不支持 blob URL 下载，用原生方法写入相册）
+        webView.addJavascriptInterface(new Object() {
+            @JavascriptInterface
+            public void save(String base64Data, String filename) {
+                try {
+                    byte[] bytes = Base64.decode(base64Data, Base64.DEFAULT);
+                    ContentValues values = new ContentValues();
+                    values.put(MediaStore.Images.Media.DISPLAY_NAME, filename);
+                    values.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+                    values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Aion");
+                    Uri uri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                    if (uri != null) {
+                        java.io.OutputStream os = getContentResolver().openOutputStream(uri);
+                        if (os != null) { os.write(bytes); os.close(); }
+                    }
+                    mainHandler.post(() -> Toast.makeText(WebViewActivity.this, "图片已保存到相册", Toast.LENGTH_SHORT).show());
+                } catch (Exception e) {
+                    mainHandler.post(() -> Toast.makeText(WebViewActivity.this, "保存失败: " + e.getMessage(), Toast.LENGTH_SHORT).show());
+                }
+            }
+        }, "AionImageSaver");
 
         // 权限请求延迟到页面加载完成后，避免系统弹窗阻塞 WebView 加载
         // 见 onPageFinished → requestPermissionsSequentially()
@@ -240,7 +274,7 @@ public class WebViewActivity extends AppCompatActivity {
         // 加载目标 URL
         targetUrl = getIntent().getStringExtra("url");
         if (targetUrl == null || targetUrl.isEmpty()) {
-            targetUrl = "http://192.168.xx.xxx:8080/chat";
+            targetUrl = "http://192.168.1.92:8080/chat";
         }
         webView.loadUrl(targetUrl);
     }

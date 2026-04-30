@@ -37,8 +37,10 @@ from routes import book as book_routes
 from routes import theater as theater_routes
 from routes import ghost_forest as ghost_forest_routes
 from routes import gift as gift_routes
+from routes import fund as fund_routes
 from activity import pc_tracker
 from memory import auto_digest
+from fund import fund_scheduler
 
 
 # ── 自动记忆总结定时任务 ──────────────────────────
@@ -91,10 +93,14 @@ async def lifespan(app: FastAPI):
         pc_tracker.start()
     except Exception as e:
         print(f"[PCActivity] ❌ 启动异常: {e}")
+    # 基金监控定时任务
+    fund_scheduler.set_event_loop(loop)
+    fund_scheduler.start()
     # 自动记忆总结定时任务
     digest_task = asyncio.create_task(_auto_digest_loop())
     yield
     digest_task.cancel()
+    fund_scheduler.stop()
     pc_tracker.stop()
     schedule_mgr.stop()
     voice.stop()
@@ -138,6 +144,7 @@ app.include_router(book_routes.router)
 app.include_router(theater_routes.router)
 app.include_router(ghost_forest_routes.router)
 app.include_router(gift_routes.router)
+app.include_router(fund_routes.router)
 
 
 # 页面
@@ -200,6 +207,10 @@ async def ghost_forest_page():
 @app.get("/gift")
 async def gift_page():
     return FileResponse(BASE_DIR / "static" / "gift.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+@app.get("/fund")
+async def fund_page():
+    return FileResponse(BASE_DIR / "static" / "fund.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 # PWA：Service Worker 必须从根路径提供，作用域才能覆盖所有页面
 @app.get("/sw.js")

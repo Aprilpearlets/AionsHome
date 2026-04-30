@@ -7,13 +7,15 @@
 - **后端**：Python FastAPI + SQLite (aiosqlite) + WebSocket
 - **前端**：多页面架构（原生 JS，无框架），暖光主题，手机/PC 自适应。chat.html 为主聊天页，独立功能页通过 common.css/common.js 共享样式和工具函数
 - **摄像头**：OpenCV (`cv2`) DirectShow 后端后台线程采集
-- **语音**：WebRTC VAD 语音检测 + 硬基流动 ASR (SenseVoiceSmall) + TTS (CosyVoice2)
+- **语音**：WebRTC VAD 语音检测 + 硬基流动 ASR (SenseVoiceSmall) + TTS (CosyVoice2) + 语音消息（按住录制）
 - **AI 接口**：硬基流动（OpenAI 兼容）、Google Gemini（REST API）、AiPro 中转站（OpenAI 兼容）
+- **AI 生图**：Gemini `gemini-3.1-flash-image-preview`（REST API generateContent，responseModalities=["IMAGE"]）
 - **Embedding**：Gemini `gemini-embedding-001`（3072维），余弦相似度检索
-- **Android App**：Java，WebView + 前台推送服务（OkHttp 4.12.0 WebSocket）+ 原生录音桥 + 原生摄像头桥，compileSdk 34 / minSdk 24
+- **Android App**：Java，WebView + 前台推送服务（OkHttp 4.12.0 WebSocket）+ 原生录音桥 + 原生摄像头桥 + 原生视频录制桥（MediaCodec + MediaMuxer），compileSdk 34 / minSdk 24
 - **音乐**：pyncm（网易云音乐 API，搜索/歌曲详情/音频URL，支持 MUSIC_U Cookie VIP 登录 + 服务端代理推流）
 - **EPUB 解析**：ebooklib（EPUB 读取）+ BeautifulSoup4 / lxml（HTML 解析）
-- **依赖库**：fastapi, uvicorn, httpx, aiosqlite, opencv-python, Pillow, sounddevice, numpy, webrtcvad-wheels, pyncm, pywin32, psutil, ebooklib, beautifulsoup4, lxml
+- **基金监控**：akshare（A股/基金数据拉取）+ chinese-calendar（中国节假日/交易日判断）
+- **依赖库**：fastapi, uvicorn, httpx, aiosqlite, opencv-python, Pillow, sounddevice, numpy, webrtcvad-wheels, pyncm, pywin32, psutil, ebooklib, beautifulsoup4, lxml, akshare, chinese-calendar
 
 ## 模块化文件结构
 项目已从单文件拆分为 12 个模块化文件：
@@ -29,13 +31,16 @@
 │   ├── AionMonitoralart.mp3      # Core 查看监控前的提示音
 │   ├── AIonResponse.mp3          # 语音唤醒回复音频（"诶，我在呢"）
 │   ├── UserIcon.png              # 用户聊天头像
-│   └── AIIcon.png                # AI 聊天头像
+│   ├── AIIcon.png                # AI 聊天头像
+│   └── 生图锚点.jpg             # SELFIE 参考图（AI 人物一致性锚点）
 ├── AionApp/                      # Android WebView 原生壳（Java，Android Studio 项目）
 │   ├── app/src/main/java/com/aion/chat/
 │   │   ├── LauncherActivity.java # 启动页：双地址选择（家庭WiFi / Tailscale）+ 记住选择 + 启动推送服务
 │   │   ├── WebViewActivity.java  # WebView 主页：全屏加载 chat.html，麦克风权限，前后台状态通知推送服务
-│   │   ├── AudioBridge.java      # 原生录音桥：AudioRecord 16kHz → base64 → JS 回调
-│   │   ├── CameraBridge.java     # 原生摄像头桥：legacy Camera API → NV21 字节旋转 → JPEG → JS 轮询（绕过 WebView HTTPS 限制）
+│   │   ├── AudioBridge.java      # 原生录音桥：AudioRecord 16kHz → base64 → JS 回调，录制时同步转发 PCM 给 VideoBridge
+│   │   ├── CameraBridge.java     # 原生摄像头桥：legacy Camera API → NV21 字节旋转 → JPEG → JS 轮询（绕过 WebView HTTPS 限制），录制时转发帧给 VideoBridge
+│   │   ├── VideoBridge.java      # 原生视频录制桥：MediaCodec(H.264) + MediaCodec(AAC) + MediaMuxer → MP4，复用 CameraBridge/AudioBridge 的帧数据
+│   │   ├── (AionImageSaver)      # 图片保存桥（WebViewActivity 内匿名类）：JS base64 → MediaStore 写入相册
 │   │   └── AionPushService.java  # 前台推送服务：独立 WebSocket 长连接 + 通知弹窗 + 断线重连 + WakeLock/WifiLock 保活
 │   └── build.gradle              # compileSdk 34, minSdk 24, Gradle 8.5 + AGP 8.2.2, OkHttp 4.12.0
 ├── LittleToy/                    # BLE 玩具逆向分析 & 独立 demo
@@ -55,6 +60,7 @@
     ├── schedule.py               # 日程/闹铃/定时监控管理器：ScheduleManager、文本指令解析、闹铃触发Core唤醒、定时监控截图+Core分析（注入设备活动摘要）
     ├── ghost_forest.py            # 奥罗斯幽林 TRPG 引擎：会话管理、AI 对话历史压缩、D20 骰子判定、角色属性/道具系统
     ├── gift.py                    # 礼物系统：AI 判断送礼 + 硅基流动 Kolors 生图 + 礼物数据 CRUD
+    ├── fund.py                    # 基金持仓监控：akshare数据拉取、盈亏计算、上证指数、历史走势、AI分析prompt生成、每日14:45定时任务(FundScheduler)
     ├── book.py                    # EPUB 解析模块：书籍导入、章节拆分、段落标注、图片提取
     ├── routes/
     │   ├── __init__.py
@@ -66,13 +72,14 @@
     │   ├── cam.py                # 摄像头控制 + 监控日志 API
     │   ├── location.py           # 定位 API：心跳上报、状态查询、POI搜索、配置管理、设置家位置
     │   ├── files.py              # 上传、聊天记录文件导出/管理
-    │   ├── settings.py           # 设置、世界书、模型列表、TTS 代理、视频通话开关
+    │   ├── settings.py           # 设置、世界书、模型列表、TTS 代理、视频通话开关、AI生图开关
     │   ├── memories.py           # 记忆库 CRUD + 手动总结触发 + 原文查看 + 锚点管理 API
     │   ├── heart_whispers.py     # 心语 API（列表查询 + 删除）
     │   ├── activity.py           # 活动日志 API（上报/查询/清理/状态诊断/10分钟摘要/AI联动开关配置）
     │   ├── voice.py              # 语音唤醒/通话控制 API
     │   ├── ghost_forest.py       # 奥罗斯幽林 TRPG API（16 个端点：人设/会话/剧情生成/选择/骰子/大结局）+ SSE 流式 TTS
-    │   └── gift.py               # 礼物系统 API（pending/receive/list/delete/test）
+    │   ├── gift.py               # 礼物系统 API（pending/receive/list/delete/test）
+    │   └── fund.py               # 基金监控 API：持仓CRUD、配置开关、数据拉取、手动触发AI分析、缓存读取、历史走势
     ├── activity.py               # 设备活动日志：JSONL 存储、自动清理（保留最近 3 小时）、PC 前台窗口采集（win32gui+psutil）、App 包名→中文名映射、10分钟窗口摘要（时长权重+carry-forward状态追溯）、AI联动开关+Prompt摘要生成
     ├── music.py                  # pyncm 封装层（搜索/歌曲详情/音频URL/MUSIC_U Cookie 登录/匿名登录）
     ├── README.md                 # 本文件
@@ -95,7 +102,8 @@
     │   ├── theater.html          # 小剧场页 → /theater（独立聊天+多角色管理+TTS，茶色暗色主题）
     │   ├── ghost-forest.html     # 奥罗斯幽林页 → /ghost-forest（TRPG 游戏：D20 骰子+角色扮演+AI DM）
     │   ├── gift.html              # 爱的印记页 → /gift（礼物陈列馆，缩略图网格+详情弹窗）
-    │   ├── video-call.js         # 视频通话模块：摄像头预览 + 截图 + 语音复用 + 来电/去电 UI
+    │   ├── fund.html              # 奥罗斯财团页 → /fund（基金持仓监控、数据拉取、AI分析、持仓管理）
+    │   ├── video-call.js         # 视频通话模块：摄像头预览 + 按住录制视频 + ASR转写 + 来电/去电 UI
     │   ├── manifest.json         # PWA Web App Manifest（从 /manifest.json 提供）
     │   └── sw.js                 # PWA Service Worker（从 /sw.js 提供）
     └── data/                     # ★ 备份只需复制此文件夹
@@ -114,6 +122,8 @@
         ├── activity_logs/        # 设备活动日志（JSONL，按日期，保留最近 3 小时）
         ├── books/                # EPUB 书籍数据（解析后的章节+图片+批注数据库）
         ├── theater_personas.json # 小剧场角色预设（多套人设，JSON数组）
+        ├── fund_config.json      # 基金监控配置（开关、投资倾向）
+        ├── fund_cache.json       # 基金数据缓存（最近一次拉取结果）
         └── ghost_forest/          # 奥罗斯幽林 TRPG 数据
             ├── _personas.json     # DM/玩家人设预设
             └── {uuid}.json        # 游戏会话存档（每局一个文件）
@@ -137,6 +147,7 @@
 | `/theater` | theater.html 小剧场页（独立聊天+多角色+TTS） |
 | `/ghost-forest` | ghost-forest.html 奥罗斯幽林页（TRPG 冒险游戏） |
 | `/gift` | gift.html 爱的印记页（礼物陈列馆） |
+| `/fund` | fund.html 奥罗斯财团页（基金持仓监控） |
 | `/manifest.json` | PWA Web App Manifest |
 | `/sw.js` | PWA Service Worker（根路径提供，作用域覆盖全站） |
 | `/public/*` | 公共资源 |
@@ -180,6 +191,7 @@
 6. **上下文长度控制** — 滑块 1-100 条可调，默认 20
 7. **世界书（World Book）** — AI/用户人设 + 自定义名称，注入 prompt 前缀
 8. **图片/视频上传** — 多模态支持，Gemini 用 inline_data，硅基流动用 URL
+9. **语音消息** — 微信风格按住说话录音，松手发送。浏览器使用 MediaRecorder 录制 WebM，Android 使用原生 AudioBridge 录音。录音通过硅基流动 ASR 自动转写为文字，消息以语音气泡形式展示（显示时长 + 播放按钮），转写文本同时保存供记忆/上下文使用
 9. **聊天记录文件管理** — 自动导出 .md，文件管理器弹窗查看/下载/删除
 10. **API Key 管理** — 界面内设置面板，支持 Gemini + Gemini Free（哨兵+向量）+ 硅基流动 + 中转站 四组 Key
 11. **手机适配** — 侧栏抽屉式展开，聊天气泡布局，触屏友好，`@media (max-width: 768px)` 单独优化紧凑间距
@@ -293,32 +305,89 @@
 ```
 
 ### 视频通话（[视频电话]）
-204. **视频通话模式** — 在语音唤醒基础上增加摄像头画面，实现「看到你 + 听到你 + 跟你说话」的完整通话体验。功能本质是语音通话 + 摄像头截图，不涉及 WebRTC 实时音视频流
+204. **视频通话模式** — 摄像头预览 + 按住录制视频片段 + ASR 转写 + AI 多模态理解，实现「看到你 + 听到你 + 跟你说话」的完整通话体验。录制的视频片段直接发送给 Gemini（inline_data，最大 20MB），AI 可以看到画面和听到声音
 205. **用户主动发起** — 聊天页面 📹 按钮发起视频通话，3 秒等待期间播放铃声动画，用户可取消
 206. **AI 主动发起** — AI 回复包含 `[视频电话]` 指令时，后端延迟 10 秒后通过 WebSocket 定向推送给发送者客户端，前端弹出来电 UI（铃声 + 接听/挂断按钮）
 207. **来电指示器** — AI 回复触发视频通话时，消息底部显示「📹 AI 正在发起视频通话...」动画指示器，10 秒后自动消失并触发来电 UI
 208. **摄像头预览** — 全屏通话界面显示用户摄像头画面（主画面）和 AI 头像（画中画），支持点击切换大小画面位置
-209. **摄像头截图** — 每条用户语音消息发送时自动截取当前摄像头画面，以 base64 JPEG 附加到消息中，AI 可以看到用户
-210. **前后摄像头切换** — 通话界面 🔄 按钮支持前后摄像头切换
-211. **语音复用** — 通话中的语音录音/ASR/TTS 完全复用现有语音唤醒系统，使用相同的 1.5 秒静音截断 + VAD 检测
-212. **Android 原生摄像头桥** — WebView 非安全上下文（HTTP 局域网）无法调用 `getUserMedia({video})`，通过 `CameraBridge.java` 使用 legacy Camera API 采集预览帧，NV21 纯字节数组旋转（不经过 Bitmap），后台线程 JPEG 编码，`setPreviewCallbackWithBuffer` 避免 GC 冻结，JS 通过 `requestAnimationFrame` 轮询 `getFrame()` 获取已旋转的 base64 JPEG
-213. **开关控制** — 聊天配置面板中「视频通话」开关控制 AI 是否具有发起视频通话的能力（`[视频电话]` 指令是否注入 prompt），用户主动发起不受开关影响
-214. **前端指令过滤** — 流式输出时前端实时 strip `[视频电话]`，用户看不到原始指令
-215. **消息保存** — 通话中的语音消息正常保存到聊天记录，截图作为图片附件一并存储
-216. **Chrome 兼容** — PC/手机 Chrome 浏览器使用标准 `getUserMedia` API 获取摄像头，无需原生桥；Android WebView 自动 fallback 到 `CameraBridge`
+209. **按住录制** — 通话界面底部「🎙 按住录制」按钮，按住开始录制视频+音频，松手停止并自动发送。支持上滑取消录制，最长录制 60 秒（自动停止）
+210. **浏览器双轨录制** — PC/手机 Chrome 使用双 MediaRecorder：一轨录制视频+音频（WebM），一轨单独录制音频（用于 ASR 转写），确保视频和转写文本同时获得
+211. **Android 原生视频录制** — `VideoBridge.java` 使用 MediaCodec(H.264) + MediaCodec(AAC) + MediaMuxer 编码 MP4，复用 CameraBridge 的 NV21 预览帧和 AudioBridge 的 PCM 音频帧，录制期间摄像头预览不中断
+212. **视频片段附件** — 录制完成后上传视频文件，ASR 转写音频，构建 `{type: "video_clip", url, duration, transcript}` 附件发送到聊天
+213. **Gemini 视频理解** — 当前消息的视频以 inline_data 发送给 Gemini（支持 video/mp4、video/webm），AI 可以同时理解画面和音频内容；历史消息中的视频片段仅保留转写文本 `[视频通话] {transcript}`，不重复发送视频数据
+214. **视频气泡** — 聊天记录中视频片段以渐变色气泡展示（📹 图标 + 时长），点击可全屏播放
+215. **前后摄像头切换** — 通话界面 🔄 按钮支持前后摄像头切换
+216. **不活跃自动挂断** — 120 秒内无任何录制操作自动挂断通话
+217. **开关控制** — 聊天配置面板中「视频通话」开关控制 AI 是否具有发起视频通话的能力（`[视频电话]` 指令是否注入 prompt），用户主动发起不受开关影响
+218. **前端指令过滤** — 流式输出时前端实时 strip `[视频电话]`，用户看不到原始指令
+
+### AI 生图（[SELFIE:xxx] / [DRAW:xxx]）
+400. **AI 自主生图** — AI 在回复中输出 `[SELFIE:prompt]`（自拍/角色一致性生图）或 `[DRAW:prompt]`（自由创作生图）指令，后端自动检测并异步调用 Gemini 生图 API
+401. **SELFIE 模式** — 附带 `public/生图锚点.jpg` 作为参考图片（base64 inlineData），Gemini 基于参考图生成角色一致的新图片，适合 AI 发自拍
+402. **DRAW 模式** — 纯文本 prompt 自由生图，不附带参考图，适合 AI 画画/创作
+403. **异步非阻塞** — 生图任务通过 `asyncio.create_task()` 在后台执行，不阻塞聊天流和页面操作。生图期间用户可继续发消息、切换页面
+404. **加载指示器** — 检测到生图指令后在 AI 消息下方显示「🎨 {AI名} 正在发送图片 ● ● ●」橙色主题弹跳动画（renderMessages 重建后自动恢复）
+405. **图片消息** — 生图完成后，图片保存到 `data/uploads/img_gen_{timestamp}.{ext}`，创建新 assistant 消息（附带图片附件），通过 WebSocket 广播 `msg_created` + `image_gen_done` 事件
+406. **图片查看器** — 聊天中的图片点击后弹出全屏 lightbox，支持保存图片（浏览器用 blob 下载，Android App 通过 `AionImageSaver` 原生桥接写入相册）
+407. **前端指令过滤** — 流式输出时前端实时 strip `[SELFIE:xxx]` 和 `[DRAW:xxx]`，用户看不到原始指令
+408. **TTS 过滤** — TTS 合成时自动剥除 `[SELFIE:...]` 和 `[DRAW:...]` 内容，不会被语音朗读
+409. **开关控制** — 聊天配置面板中「AI 生图」开关控制 AI 是否具有生图能力（指令是否注入 prompt），关闭后 AI 不会尝试生图
+410. **Gemini API** — 使用 `gemini-3.1-flash-image-preview` 模型，REST `generateContent` 端点，`responseModalities: ["IMAGE", "TEXT"]`，120 秒超时
+411. **三处统一** — send_message、regenerate、Core/语音/定时触发三套 `_bg_generate` 函数均支持生图指令检测和异步生图
+
+### AI 生图工作流程
+```
+【AI 触发生图（正常聊天 / 语音 / Core 主动发言）】
+  AI 回复包含 [SELFIE:穿着白裙子在花园里] 或 [DRAW:一只飞翔的龙]
+  → 后端 regex 检测 → 从显示文本和数据库中 strip 掉
+  → SSE 发 image_gen_start 事件 + WebSocket 广播
+  → 前端显示「🎨 正在发送图片」橙色指示器
+  → asyncio.create_task(_do_image_gen(...))
+
+【异步生图（_do_image_gen）】
+  ├ SELFIE 模式：读取 public/生图锚点.jpg → base64 编码 → 作为 inlineData 附加到请求
+  ├ DRAW 模式：仅发送文本 prompt
+  → POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-image-preview:generateContent
+    requestBody: { contents: [{parts: [...]}], generationConfig: {responseModalities: ["IMAGE", "TEXT"]} }
+  → 解析 response → 提取 inlineData（base64 图片数据）
+  → 保存到 data/uploads/img_gen_{timestamp}.{ext}
+  → 创建 assistant 消息（附带图片附件 URL）
+  → WebSocket 广播 msg_created + image_gen_done
+  → 前端移除指示器 + 渲染新消息（含图片）
+
+【生图失败】
+  → WebSocket 广播 image_gen_failed
+  → 前端移除指示器
+
+【图片保存（全屏查看器）】
+  点击图片 → 全屏 lightbox
+  ├ 浏览器：fetch → blob → createObjectURL → <a download> 模拟点击
+  └ Android App：fetch → blob → FileReader → base64 → AionImageSaver.save() → MediaStore 写入相册
+```
+215. **消息保存** — 通话中的视频片段正常保存到聊天记录，视频文件上传到 `data/uploads/`，转写文本存入附件数据
+216. **Chrome 兼容** — PC/手机 Chrome 浏览器使用标准 `getUserMedia` API 获取摄像头+麦克风，无需原生桥；Android WebView 自动 fallback 到 `CameraBridge` + `AudioBridge` + `VideoBridge`
 
 ### 视频通话工作流程
 ```
 【用户主动发起】
   点击 📹 按钮 → 3 秒等待（播放铃声动画）→ 进入通话界面
   → 启动摄像头（getUserMedia 或 AionCamera 原生桥）
-  → 启动语音录音（复用语音唤醒 AudioBridge）
-  → 循环：
-    ├ VAD 检测 + 1.5 秒静音截断 → ASR 识别
-    ├ 截取摄像头画面 → base64 JPEG 附加到消息
-    ├ 发送消息到聊天（含截图）→ AI 回复 + TTS
-    └ TTS 播完 → 继续录音
-  → 挂断 → 停止摄像头 + 录音
+  → 启动音频流（仅预热，不录制）
+  → 底部显示「🎙 按住录制」按钮 + 挂断按钮
+
+【按住录制（核心交互）】
+  按下录制按钮 → 开始录制：
+    浏览器：双 MediaRecorder（视频+音频 WebM / 纯音频 WebM）
+    Android：AionVideo.startRecord() → MediaCodec H.264 + AAC + MediaMuxer
+  → 界面显示录制计时 + 红色脉冲动画
+  → 上滑进入「取消区域」→ 松手取消录制
+  → 正常松手 → 停止录制：
+    浏览器：双 Blob → 上传视频 + ASR 转写音频
+    Android：AionVideo.stopRecord() → base64 MP4 → 上传 + 收集的 PCM 帧构建 WAV → ASR
+  → 构建 {type:"video_clip", url, duration, transcript}
+  → POST 发送消息到聊天（视频 inline_data 发给 Gemini）
+  → AI 回复 + TTS → 录制按钮暂时禁用
+  → TTS 播完 → 恢复录制按钮 → 等待下次按住
 
 【AI 主动发起】
   AI 回复包含 [视频电话] → 后端检测 → 从显示文本 strip
@@ -328,6 +397,20 @@
   → 用户接听 → 进入通话界面（同上）
   → 用户挂断/超时 → 取消
 
+【历史消息处理】
+  当前消息 → 视频以 inline_data 发送给 Gemini（AI 看到画面+听到音频）
+  历史消息 → 仅保留转写文本「[视频通话] {transcript}」（不重复发送视频）
+  记忆总结/哨兵 → 仅使用转写文本
+
+【Android 原生视频录制桥（VideoBridge.java）】
+  JS 调用 AionVideo.startRecord(width, height)
+  → 创建 MediaCodec 视频编码器（H.264, NV12）+ 音频编码器（AAC, 16kHz mono）
+  → MediaMuxer 准备写入临时 MP4 文件
+  → CameraBridge.processFrame() 中转发 NV21 帧 → NV21→NV12 转换 → 送入视频编码器
+  → AudioBridge 录音线程中转发 PCM 帧 → 送入音频编码器
+  → 编码输出同步写入 MediaMuxer
+  → JS 调用 AionVideo.stopRecord() → flush + stop → 读取 MP4 文件 → base64 返回
+
 【Android 原生摄像头桥（CameraBridge.java）】
   JS 调用 AionCamera.start("user"|"environment")
   → Camera.open() → 设置 640×480 NV21 预览
@@ -336,7 +419,8 @@
   → 后台 ExecutorService 线程：
     ├ NV21 纯字节数组旋转（rotateNV21_CW90/270/180，~1ms）
     ├ YuvImage.compressToJpeg（已旋转的竖屏 JPEG）
-    └ Base64 编码 → 更新 lastFrameB64
+    ├ Base64 编码 → 更新 lastFrameB64
+    └ 录制中？→ 转发旋转后的 NV21 帧给 VideoBridge.onVideoFrame()
   → JS requestAnimationFrame 轮询 getFrame() → 更新 <img>.src
 ```
 
@@ -851,6 +935,39 @@
   → 可删除 → DELETE /api/gift/{id}（同步清理图片文件）
 ```
 
+### 奥罗斯财团（基金持仓监控）
+326. **持仓管理** — SQLite `fund_holdings` 表存储基金持仓信息（代码、名称、份额、平均成本、总成本、跌幅/涨幅预警阈值），前端支持添加/编辑/删除，持仓列表可折叠收起
+327. **数据拉取（不涉及 AI）** — 使用 akshare 拉取所有持仓基金的最新净值和涨跌幅（`fund_open_fund_daily_em` + `fund_open_fund_info_em` 兜底），新浪财经接口拉取上证指数实时涨跌。根据持仓计算当前市值、浮盈亏金额/百分比，检查是否触发预警阈值。拉取结果缓存到 `fund_cache.json`，刷新页面后仍可显示
+328. **历史走势查询** — `fund_open_fund_info_em` 拉取最近 N 天净值走势，分析时注入近 30 日走势摘要（最低/最高/整体趋势）
+329. **AI 分析** — 将持仓数据 + 历史走势 + 大盘背景 + 用户投资倾向拼成结构化 prompt，连同世界书人设 + 最近 20 条聊天上下文一起发送给当前聊天模型。AI 回复作为 assistant 消息插入聊天 + TTS 语音播报 + WebSocket 广播
+330. **每日定时分析** — `FundScheduler` 后台线程每 30 秒检查，交易日 14:45 自动触发分析。使用 `chinese_calendar.is_workday()` 判断交易日（自动处理周末 + 中国法定节假日含调休）
+331. **功能开关** — 顶部 toggle 开关，状态持久化在 `fund_config.json`，关闭后定时任务不触发、不影响其他功能
+332. **投资倾向** — 可编辑的文本框，保存后在 AI 分析时注入 prompt（如"计划买入黄金，等合适坑位"），帮助 AI 给出更贴合的建议
+333. **手动操作** — 「🔄 刷新数据」仅拉取数据不调 AI；「📊 立即分析」拉数据 + 调 AI + TTS，操作不阻塞页面，可自由切换到其他页面
+334. **主页入口** — home.html APPS 数组增加「奥罗斯财团」（`/fund`）
+
+### 奥罗斯财团工作流程
+```
+【手动刷新数据（不调 AI）】
+  点击「🔄 刷新数据」→ POST /api/fund/fetch
+  → akshare 拉取全量基金日数据 + 新浪财经拉取上证指数
+  → 逐只匹配持仓基金，计算盈亏、检查预警
+  → 缓存到 fund_cache.json → 返回前端渲染
+
+【手动/定时 AI 分析】
+  点击「📊 立即分析」→ POST /api/fund/analyze（或 14:45 定时触发）
+  → 拉取持仓数据 + 30 日历史走势
+  → 生成分析 prompt（持仓明细 + 走势摘要 + 大盘 + 投资倾向）
+  → 组装消息（世界书人设 + 20 条上下文 + prompt）
+  → stream_ai() 流式调用当前模型
+  → 插入系统消息「💰 奥罗斯财团 — 基金持仓分析」+ AI 回复
+  → TTS 语音播报 + WebSocket 广播到聊天页
+
+【定时任务（FundScheduler）】
+  后台线程每 30 秒检查 → 14:45 + 交易日 + 开关开启 → 触发 run_fund_analysis()
+  → 等待到 14:46 避免重复触发
+```
+
 ### 浏览器保活 & 系统通知
 105. **静音音频保活** — 页面加载后自动创建 AudioContext 播放无声音频（30秒循环），防止手机浏览器后台休眠导致 WebSocket 断连和闹铃失效
 106. **Web Notification** — 闹铃触发和监控提醒时通过 `Notification API` 发送系统级推送通知，即使浏览器在后台也能看到
@@ -858,8 +975,9 @@
 ### Android 原生 App（AionApp / Aion Oloth）
 107. **WebView 壳应用** — Java Android 项目，WebView 加载 chat.html，支持文件上传、麦克风权限、全屏沉浸
 108. **双地址启动页** — LauncherActivity 提供「家庭WiFi」和「Tailscale」两个地址入口，支持「记住选择」下次自动进入
-109. **原生录音桥 AudioBridge** — 绕过 WebView 中 `getUserMedia` 需要 HTTPS 的限制，使用 Android 原生 `AudioRecord`（16kHz, VOICE_RECOGNITION）录音，通过 `@JavascriptInterface` 将 base64 PCM 数据回调到 JS
-110. **手势导航适配** — 兼容 Vivo X300 Pro 等全面屏手势导航，返回键弹出对话框（切换地址 / 退出 / 取消）
+109. **原生录音桥 AudioBridge** — 绕过 WebView 中 `getUserMedia` 需要 HTTPS 的限制，使用 Android 原生 `AudioRecord`（16kHz, VOICE_RECOGNITION）录音，通过 `@JavascriptInterface` 将 base64 PCM 数据回调到 JS。视频录制期间自动转发 PCM 帧给 VideoBridge
+110. **原生视频录制桥 VideoBridge** — MediaCodec(H.264) + MediaCodec(AAC) + MediaMuxer 编码 MP4，复用 CameraBridge 的视频帧和 AudioBridge 的音频帧进行视频录制，录制期间摄像头预览不中断。JS 通过 `window.AionVideo` 接口控制录制（`startRecord`/`stopRecord`/`cancel`），`stopRecord` 返回 base64 编码的 MP4 数据
+111. **手势导航适配** — 兼容 Vivo X300 Pro 等全面屏手势导航，返回键弹出对话框（切换地址 / 退出 / 取消）
 
 ### Android 前台推送服务（AionPushService）
 115. **前台服务 + 独立 WebSocket** — `AionPushService` 作为 Android 前台服务运行，通过 OkHttp 维持独立于 WebView 的 WebSocket 长连接（`/ws`），不依赖页面生命周期
@@ -1158,6 +1276,7 @@
 | `music` | 音乐卡片数据：主推荐歌曲 + 候选列表 |
 | `poi_search` | POI 搜索触发：含 msg_id + categories，前端显示蓝色搜索指示器 |
 | `toy_command` | 玩具控制指令：含 commands 数组 + msg_id |
+| `image_gen_start` | AI 生图开始：含 msg_id + prompt + is_selfie，前端显示橙色生图指示器 |
 | `debug` | Debug 数据：模型名、token 用量、召回记忆、完整 prompt |
 | `done` | 流结束 |
 
@@ -1183,6 +1302,9 @@
 | `tts_chunk` | TTS 音频分片推送（含 msg_id/seq/url），前端收到即加入播放队列 |
 | `tts_done` | TTS 合成完毕通知（含 msg_id），前端标记该消息队列已结束，播完最后一片后清理 |
 | `tts_state` | 客户端→服务端：TTS 开关/音色同步（`{enabled, voice}`），服务端据此判断是否需要合成 |
+| `image_gen_start` | AI 生图开始广播（SSE + WS 双通道） |
+| `image_gen_done` | AI 生图完成广播（含 conv_id），前端移除指示器 |
+| `image_gen_failed` | AI 生图失败广播（含 conv_id），前端移除指示器 |
 
 ### 消息角色说明
 | 角色 | 说明 | 是否显示在聊天 |
@@ -1206,6 +1328,8 @@
    - [SCHEDULE_DEL:id]      — 删除日程（始终可用）
    - [TOY:1]~[TOY:9]        — 控制玩具预设档位（仅密语模式开启时）
    - [TOY:STOP]             — 停止玩具（仅密语模式开启时）
+   - [SELFIE:prompt]        — AI 自拍生图（附带参考图，仅 AI 生图开关开启时）
+   - [DRAW:prompt]          — AI 自由画图（仅 AI 生图开关开启时）
    - 【当前日程列表】         — 活跃日程/闹铃一览
    - 【位置信息】             — 当前地址 + 实时天气 + 离家距离 + 状态（仅有有效坐标时注入）
 4. 当前准确时间                                                    ← ⚡缓存分界点

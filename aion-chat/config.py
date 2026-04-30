@@ -118,19 +118,15 @@ def sanitize_filename(name):
 
 # ── 模型配置 ─────────────────────────────────────
 MODELS = {
-    "硅基GLM-5":        {"provider": "siliconflow", "model": "Pro/zai-org/GLM-5"},
     "硅基GLM-5.1":      {"provider": "siliconflow", "model": "Pro/zai-org/GLM-5.1"},
-    "硅基Kimi-K2.5":    {"provider": "siliconflow", "model": "Pro/moonshotai/Kimi-K2.5"},
-    "gemini-3.1-flash-lite": {"provider": "gemini", "model": "gemini-3.1-flash-lite-preview"},
-    "gemini-2.5-pro":        {"provider": "gemini", "model": "gemini-2.5-pro"},
-    "gemini-3-flash":        {"provider": "gemini", "model": "gemini-3-flash-preview"},
-    "gemini-3.1-pro":        {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
-    "claude-sonnet-4-6":  {"provider": "aipro", "model": "claude-sonnet-4-6"},
-    "claude-opus4.6":    {"provider": "aipro", "model": "claude-opus-4-6"},
-    "claude-opus4.6T":    {"provider": "aipro", "model": "claude-opus-4-6-thinking"},
-    "哈基米3.1pro":    {"provider": "aipro", "model": "gemini-3.1-pro-high"},
-    "哈基米2.5pro":    {"provider": "aipro", "model": "gemini-2.5-pro"},
-    
+    "硅基Kimi-K2.6":    {"provider": "siliconflow", "model": "Pro/moonshotai/Kimi-K2.6"},
+    "gemini-2.5-pro":  {"provider": "gemini", "model": "gemini-2.5-pro"},
+    "gemini-3-flash":  {"provider": "gemini", "model": "gemini-3-flash-preview"},
+    "gemini-3.1-pro":  {"provider": "gemini", "model": "gemini-3.1-pro-preview"},
+    "claude-sonnet-4-6": {"provider": "aipro", "model": "claude-sonnet-4-6"},
+    "claude-opus4.6":  {"provider": "aipro", "model": "claude-opus-4-6"},
+    "哈基米gpt-5.5":    {"provider": "aipro", "model": "gemini-3.1-pro-high"},
+    "哈基米3.1pro":     {"provider": "aipro", "model": "gemini-3.1-pro-high"},
     
 }
 
@@ -170,4 +166,6 @@ def save_cam_config(cfg: dict):
 
 # ── 允许上传的文件类型 ────────────────────────────
 ALLOWED_TYPES = {'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-                 'video/mp4', 'video/webm', 'video/quicktime'}
+                 'video/mp4', 'video/webm', 'video/quicktime',
+                 'audio/webm', 'audio/ogg', 'audio/wav', 'audio/mp4',
+                 'audio/mpeg', 'audio/x-wav'}

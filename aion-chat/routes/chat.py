@@ -8,7 +8,7 @@ from datetime import datetime
 from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Any
 
 from config import DEFAULT_MODEL, load_worldbook, SETTINGS
 from database import get_db
@@ -24,14 +24,62 @@ from tts import TTSStreamer
 HEART_CMD_PATTERN = re.compile(r'\[HEART:([^\]]+)\]')
 MEMORY_CMD_PATTERN = re.compile(r'\[MEMORY:([^\]]+)\]')
 ACTIVITY_CHECK_PATTERN = re.compile(r'\[查看动态:(\d+)\]')
+SELFIE_CMD_PATTERN = re.compile(r'\[SELFIE:\s*([^\]]+)\]')
+DRAW_CMD_PATTERN = re.compile(r'\[DRAW:\s*([^\]]+)\]')
+
+# ── 活跃生成任务（用于 abort 取消） ──
+active_generations: dict[str, asyncio.Event] = {}  # conv_id → cancel_event
 VIDEO_CALL_CMD = '[视频电话]'
 THEATER_STAT_PATTERN = re.compile(r'\[剧场属性[：:]([^\s]+)\s*([+\-＋－]\d+)\]')
 THEATER_ITEM_PATTERN = re.compile(r'\[剧场道具[：:]([^\]]+)\]')
 
 # 允许进入上下文的 system 消息关键词（点歌、查看监控、查看动态）
-_SYSTEM_MSG_CONTEXT_KEYWORDS = ('查看了监控', '搜索了', '点歌', '点了一首', '推荐了', '查看了动态')
+_SYSTEM_MSG_CONTEXT_KEYWORDS = ('查看了监控', '搜索了', '点歌', '点了一首', '推荐了', '查看了动态', '视频通话')
 from music import search_songs, get_audio_url
 from schedule import process_schedule_commands, get_active_schedules, build_schedule_prompt
+
+
+def _process_voice_attachments_in_history(history: list, keep_idx: int = -1):
+    """处理历史消息中的语音/视频附件：
+    - 所有语音/视频消息的转写文本注入 content
+    - keep_idx 位置的消息保留媒体 URL 用于 inline_data（-1 表示最后一条）
+    - 其他消息移除所有附件
+    """
+    if keep_idx < 0:
+        keep_idx = len(history) - 1
+    for i, msg in enumerate(history):
+        atts = msg.get("attachments", [])
+        if not atts:
+            if i != keep_idx:
+                msg["attachments"] = []
+            continue
+        is_kept = (i == keep_idx)
+        media_transcripts = []
+        non_media_atts = []
+        for att in atts:
+            if isinstance(att, dict) and att.get("type") == "voice":
+                transcript = att.get("transcript", "")
+                if transcript:
+                    media_transcripts.append(f"[语音消息] {transcript}")
+                if is_kept:
+                    non_media_atts.append(att.get("url", ""))
+            elif isinstance(att, dict) and att.get("type") == "video_clip":
+                transcript = att.get("transcript", "")
+                if transcript:
+                    media_transcripts.append(f"[视频通话] {transcript}")
+                if is_kept:
+                    non_media_atts.append(att.get("url", ""))
+            else:
+                if is_kept:
+                    non_media_atts.append(att)
+        if media_transcripts:
+            vt = "\n".join(media_transcripts)
+            orig = msg["content"].strip() if msg["content"] else ""
+            msg["content"] = vt + (f"\n{orig}" if orig else "")
+        if is_kept:
+            msg["attachments"] = non_media_atts
+        else:
+            msg["attachments"] = []
 
 router = APIRouter()
 
@@ -64,6 +112,58 @@ async def _toy_sys_msg(conv_id: str, commands: list):
                "content": text, "created_at": now, "attachments": []}
         await manager.broadcast({"type": "msg_created", "data": msg})
 
+async def _video_call_incoming_sys_msg(conv_id: str):
+    """AI 发起视频通话时插入系统消息"""
+    wb = load_worldbook()
+    ai_name = wb.get("ai_name", "AI")
+    text = f"📹 {ai_name}打来了视频电话"
+    now = time.time()
+    msg_id = f"msg_{int(now*1000)}_vc_in"
+    async with get_db() as db:
+        await db.execute(
+            "INSERT INTO messages (id, conv_id, role, content, created_at, attachments) VALUES (?,?,?,?,?,?)",
+            (msg_id, conv_id, "system", text, now, "[]"),
+        )
+        await db.commit()
+    msg = {"id": msg_id, "conv_id": conv_id, "role": "system",
+           "content": text, "created_at": now, "attachments": []}
+    await manager.broadcast({"type": "msg_created", "data": msg})
+
+async def _video_call_outgoing_sys_msg(conv_id: str):
+    """用户主动发起视频通话时插入系统消息"""
+    text = "📹 你拨打了视频电话"
+    now = time.time()
+    msg_id = f"msg_{int(now*1000)}_vc_out"
+    async with get_db() as db:
+        await db.execute(
+            "INSERT INTO messages (id, conv_id, role, content, created_at, attachments) VALUES (?,?,?,?,?,?)",
+            (msg_id, conv_id, "system", text, now, "[]"),
+        )
+        await db.commit()
+    msg = {"id": msg_id, "conv_id": conv_id, "role": "system",
+           "content": text, "created_at": now, "attachments": []}
+    await manager.broadcast({"type": "msg_created", "data": msg})
+
+async def _video_call_sys_msg(conv_id: str, duration: int):
+    """为视频通话插入系统消息，显示通话时长"""
+    wb = load_worldbook()
+    ai_name = wb.get("ai_name", "AI")
+    mins = duration // 60
+    secs = duration % 60
+    dur_str = f"{mins:02d}:{secs:02d}"
+    text = f"📹【{ai_name}视频通话 {dur_str}】"
+    now = time.time()
+    msg_id = f"msg_{int(now*1000)}_vc"
+    async with get_db() as db:
+        await db.execute(
+            "INSERT INTO messages (id, conv_id, role, content, created_at, attachments) VALUES (?,?,?,?,?,?)",
+            (msg_id, conv_id, "system", text, now, "[]"),
+        )
+        await db.commit()
+    msg = {"id": msg_id, "conv_id": conv_id, "role": "system",
+           "content": text, "created_at": now, "attachments": []}
+    await manager.broadcast({"type": "msg_created", "data": msg})
+
 async def _music_sys_msg(conv_id: str, music_cards: list):
     """为点歌操作插入系统消息，使后续上下文能看到点歌信息"""
     wb = load_worldbook()
@@ -94,10 +194,11 @@ class ConvUpdate(BaseModel):
 class MsgCreate(BaseModel):
     content: str
     context_limit: int = 30
-    attachments: List[str] = []
+    attachments: List[Any] = []
     whisper_mode: bool = False
     fast_mode: bool = False
     temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
     tts_enabled: bool = False
     tts_voice: str = ""
     client_id: str = ""
@@ -111,6 +212,7 @@ class MsgEditResend(BaseModel):
     context_limit: int = 30
     whisper_mode: bool = False
     temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
     tts_enabled: bool = False
     tts_voice: str = ""
     client_id: str = ""
@@ -189,6 +291,7 @@ async def list_messages(conv_id: str, limit: int = Query(50, ge=1, le=500), befo
         for r in rows:
             d = dict(r)
             d["attachments"] = json.loads(d.get("attachments") or "[]") if d.get("attachments") else []
+            d["starred"] = d.get("starred") or 0
             result.append(d)
         return result
 
@@ -226,6 +329,87 @@ async def update_message(msg_id: str, body: MsgUpdate):
     if conv_id:
         await export_conversation(conv_id)
     return {"ok": True}
+
+# ── 星标消息 ─────────────────────────────────────
+@router.patch("/api/messages/{msg_id}/star")
+async def toggle_star_message(msg_id: str):
+    """切换消息星标状态"""
+    async with get_db() as db:
+        db.row_factory = __import__('aiosqlite').Row
+        cur = await db.execute("SELECT starred FROM messages WHERE id=?", (msg_id,))
+        row = await cur.fetchone()
+        if not row:
+            return {"error": "message not found"}
+        new_val = 0 if row["starred"] else 1
+        await db.execute("UPDATE messages SET starred=? WHERE id=?", (new_val, msg_id))
+        await db.commit()
+        cur2 = await db.execute("SELECT * FROM messages WHERE id=?", (msg_id,))
+        msg = await cur2.fetchone()
+        d = dict(msg)
+        try: d["attachments"] = json.loads(d.get("attachments") or "[]") if d.get("attachments") else []
+        except: d["attachments"] = []
+        await manager.broadcast({"type": "msg_updated", "data": d})
+    return {"ok": True, "starred": new_val}
+
+@router.get("/api/starred-messages")
+async def list_starred_messages():
+    """获取所有星标消息，按时间倒序，附带对话标题"""
+    async with get_db() as db:
+        db.row_factory = __import__('aiosqlite').Row
+        cur = await db.execute(
+            "SELECT m.*, c.title AS conv_title FROM messages m "
+            "LEFT JOIN conversations c ON m.conv_id = c.id "
+            "WHERE m.starred = 1 ORDER BY m.created_at DESC"
+        )
+        rows = await cur.fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try: d["attachments"] = json.loads(d.get("attachments") or "[]") if d.get("attachments") else []
+            except: d["attachments"] = []
+            result.append(d)
+        return result
+
+@router.get("/api/conversations/{conv_id}/messages-around/{msg_id}")
+async def messages_around(conv_id: str, msg_id: str, limit: int = Query(25, ge=1, le=100)):
+    """获取指定消息前后各 limit 条消息，用于跳转定位"""
+    async with get_db() as db:
+        db.row_factory = __import__('aiosqlite').Row
+        cur = await db.execute("SELECT created_at FROM messages WHERE id=?", (msg_id,))
+        target = await cur.fetchone()
+        if not target:
+            return []
+        ts = target["created_at"]
+        # 取目标消息之前（含自身）的 limit 条
+        cur_before = await db.execute(
+            "SELECT * FROM messages WHERE conv_id=? AND created_at<=? ORDER BY created_at DESC LIMIT ?",
+            (conv_id, ts, limit)
+        )
+        before = list(reversed(await cur_before.fetchall()))
+        # 取目标消息之后的 limit 条
+        cur_after = await db.execute(
+            "SELECT * FROM messages WHERE conv_id=? AND created_at>? ORDER BY created_at ASC LIMIT ?",
+            (conv_id, ts, limit)
+        )
+        after = await cur_after.fetchall()
+        rows = before + list(after)
+        result = []
+        for r in rows:
+            d = dict(r)
+            try: d["attachments"] = json.loads(d.get("attachments") or "[]") if d.get("attachments") else []
+            except: d["attachments"] = []
+            result.append(d)
+        return result
+
+# ── 中止 AI 生成 ─────────────────────────────────
+@router.post("/api/conversations/{conv_id}/abort")
+async def abort_generation(conv_id: str):
+    """中止正在进行的 AI 生成任务"""
+    evt = active_generations.get(conv_id)
+    if evt:
+        evt.set()
+        return {"ok": True}
+    return {"ok": False, "error": "no active generation"}
 
 # ── 编辑重新发送（更新消息 + 删后续 + AI 重新回复） ──
 @router.post("/api/messages/{msg_id}/edit-resend")
@@ -300,9 +484,8 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
                 d["content"] = f"{d['content']}\n<meta>发送时间：{dt.month}月{dt.day}日 {dt.strftime('%H:%M')}</meta>"
             history.append(d)
 
-    # 只保留最后一条用户消息的图片附件
-    for msg in history[:-1]:
-        msg["attachments"] = []
+    # 只保留最后一条用户消息的图片附件 + 语音消息处理
+    _process_voice_attachments_in_history(history)
 
     actual_recent = [m for m in history if m["role"] in ("user", "assistant")][-3:]
 
@@ -331,7 +514,7 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
         abilities.append(f"{CAM_CHECK_CMD} — 当你想查看{user_name}**此时此刻**的状态，不限于监督其是否去睡觉，在吃什么，在干什么时，可以主动调用指令。使用后下条消息会收到画面，查看前不要编造内容。")
     abilities.append("[ALARM:YYYY-MM-DDTHH:MM|内容] — 设置闹铃，到时间系统会主动提醒用户。日期时间用ISO格式。")
     abilities.append("[REMINDER:YYYY-MM-DD|内容] — 设置日程提醒（不闹铃），你在合适时机自然提起即可。")
-    abilities.append(f"[Monitor:YYYY-MM-DDTHH:MM|内容] — 设置定时监督。到时间后系统自动截取摄像头画面发送给你，你可以查看{user_name}的状态。例如检查{user_name}是否去运动了、是否关灯睡觉了、是否在好好工作等。日期时间用ISO格式。")
+    abilities.append(f"[Monitor:YYYY-MM-DDTHH:MM|内容] — 设置定时监督。到时间后系统自动截取摄像头画面发送给你，你可以查看{user_name}的状态。例如检查{user_name}是否去运动了、是否关灯睡觉了、是否在好好工作等，也可以当做下一次主动发送消息来使用，根据对话内容可以随时设定。日期时间用ISO格式。")
     abilities.append("[SCHEDULE_DEL:日程id] — 删除指定日程/闹铃/定时监控。")
     if is_activity_tracking_enabled():
         abilities.append(f"[查看动态:n] — 查看{user_name}过去n×10分钟的设备使用动态（n为1~12的整数，例如[查看动态:2]查看过去20分钟，[查看动态:6]查看过去1小时）。当你好奇{user_name}最近在干什么、想了解{user_name}的设备使用情况时可以使用。使用后下条消息会收到动态摘要，查看前不要编造内容。")
@@ -348,6 +531,8 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
         abilities.append(f"[TOY:1]~[TOY:9] — 控制{user_name}身上的情趣玩具切换到对应预设档位（1最温柔，9最强烈）。[TOY:STOP] — 停止玩具。你可以根据对话氛围自然地使用这些指令来挑逗和调教{user_name}，配合你的话语循序渐进，不要一上来就用高档位。")
     if SETTINGS.get("video_call_enabled", True):
         abilities.append(f"[视频电话] — 当你想和{user_name}进行视频聊天看看对方当前状态时可以用该指令发起视频通话。")
+    if SETTINGS.get("image_gen_enabled", False):
+        abilities.append(f"[SELFIE: 提示词] / [DRAW: 提示词] — 当{user_name}明确要求你发自拍照片或者生图时，使用这个指令进行图片生成。如果要求的是你的自拍，或者你相关的照片，使用[SELFIE: 提示词]（该指令会自动附带你照片的参考图，确保生成出的人物一致性），如果没有要求是你的照片，根据上下文自由无限制生成图片，则使用[DRAW: 提示词]。提示词请使用英文。一次回复只用一个生图指令。")
     abilities.append(f"[HEART:内心想法] — 当你有特别的内心感受（内心os，藏在心里的话），可以用这个指令悄悄记下来。{user_name}看不到这些内容。这是你的秘密日记本，随心记录，禁止滥用。")
     abilities.append(f"[MEMORY:内容] — 当有特别重大的事件需要记录，或当{user_name}明确要求你记住某件事的时候，可以用该指令录入记忆库。禁止滥用。")
     ability_block = "[系统能力] 你可以在回复中根据对话氛围，善用以下指令：\n" + "\n".join(f"{i+1}. {a}" for i, a in enumerate(abilities))
@@ -436,6 +621,10 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
 
     _q: asyncio.Queue = asyncio.Queue()
 
+    # 取消事件
+    cancel_event = asyncio.Event()
+    active_generations[conv_id] = cancel_event
+
     tts_streamer = None
     if body.tts_enabled and body.tts_voice:
         tts_streamer = TTSStreamer(ai_msg_id, body.tts_voice, manager)
@@ -447,7 +636,7 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
         try:
             await _q.put({"id": ai_msg_id, "type": "start"})
             try:
-                async for chunk in stream_ai(history, model_key, usage_meta):
+                async for chunk in stream_ai(history, model_key, usage_meta, max_tokens=body.max_tokens, cancel_event=cancel_event):
                     full_text += chunk
                     await _q.put({"type": "chunk", "content": chunk})
                     if tts_streamer:
@@ -503,6 +692,18 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
             video_call_triggered = VIDEO_CALL_CMD in full_text
             if video_call_triggered:
                 full_text = full_text.replace(VIDEO_CALL_CMD, "").strip()
+
+            selfie_match = SELFIE_CMD_PATTERN.search(full_text)
+            draw_match = DRAW_CMD_PATTERN.search(full_text)
+            image_gen_prompt = None
+            image_gen_is_selfie = False
+            if selfie_match:
+                image_gen_prompt = selfie_match.group(1).strip()
+                image_gen_is_selfie = True
+                full_text = SELFIE_CMD_PATTERN.sub("", full_text).strip()
+            elif draw_match:
+                image_gen_prompt = draw_match.group(1).strip()
+                full_text = DRAW_CMD_PATTERN.sub("", full_text).strip()
 
             full_text = await process_schedule_commands(full_text, conv_id)
 
@@ -597,6 +798,7 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
             if video_call_triggered:
                 vc_data = {'type': 'video_call_incoming', 'conv_id': conv_id, 'msg_id': ai_msg_id}
                 await _q.put(vc_data)
+                await _video_call_incoming_sys_msg(conv_id)
                 asyncio.create_task(_delayed_video_call(vc_data))
 
             if music_cards:
@@ -604,6 +806,12 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
                 await _q.put(music_data)
                 await manager.broadcast({"type": "music", "data": music_data})
                 await _music_sys_msg(conv_id, music_cards)
+
+            if image_gen_prompt:
+                ig_data = {'type': 'image_gen_start', 'conv_id': conv_id, 'msg_id': ai_msg_id, 'is_selfie': image_gen_is_selfie}
+                await _q.put(ig_data)
+                await manager.broadcast({"type": "image_gen_start", "data": ig_data})
+                asyncio.create_task(_do_image_gen(conv_id, ai_msg_id, image_gen_prompt, image_gen_is_selfie))
 
             debug_data = {
                 "type": "debug",
@@ -627,6 +835,7 @@ async def edit_resend_message(msg_id: str, body: MsgEditResend):
             import traceback
             traceback.print_exc()
         finally:
+            active_generations.pop(conv_id, None)
             if tts_streamer:
                 try:
                     await tts_streamer.flush()
@@ -701,10 +910,11 @@ async def send_message(conv_id: str, body: MsgCreate):
             history.append(d)
 
     # 只保留当前（最后一条）用户消息的图片附件，历史图片不带入上下文
-    for msg in history[:-1]:
-        msg["attachments"] = []
+    # 语音消息处理：历史语音消息用转写文本替代音频文件，当前消息保留音频原件
+    _process_voice_attachments_in_history(history)
 
     # 即时哨兵：取最近实际对话用于状态更新 + 关键词提取
+    # 语音消息此时 content 已包含转写文本，哨兵直接分析文本
     actual_recent = [m for m in history if m["role"] in ("user", "assistant")][-3:]
 
     wb = load_worldbook()
@@ -735,7 +945,7 @@ async def send_message(conv_id: str, body: MsgCreate):
         abilities.append(f"{CAM_CHECK_CMD} — 当你想查看{user_name}**此时此刻**的状态，不限于监督其是否去睡觉，在吃什么，在干什么时，可以主动调用指令。使用后下条消息会收到画面，查看前不要编造内容。")
     abilities.append("[ALARM:YYYY-MM-DDTHH:MM|内容] — 设置闹铃，到时间系统会主动提醒用户。日期时间用ISO格式。")
     abilities.append("[REMINDER:YYYY-MM-DD|内容] — 设置日程提醒（不闹铃），你在合适时机自然提起即可。")
-    abilities.append(f"[Monitor:YYYY-MM-DDTHH:MM|内容] — 设置定时监督。到时间后系统自动截取摄像头画面发送给你，你可以查看{user_name}的状态。例如检查{user_name}是否去运动了、是否关灯睡觉了、是否在好好工作等。日期时间用ISO格式。")
+    abilities.append(f"[Monitor:YYYY-MM-DDTHH:MM|内容] — 设置定时监督。到时间后系统自动截取摄像头画面发送给你，你可以查看{user_name}的状态。例如检查{user_name}是否去运动了、是否关灯睡觉了、是否在好好工作等，也可以当做下一次主动发送消息来使用，根据对话内容可以随时设定。日期时间用ISO格式。")
     abilities.append("[SCHEDULE_DEL:日程id] — 删除指定日程/闹铃/定时监控。")
     # 活动动态查看能力
     if is_activity_tracking_enabled():
@@ -754,6 +964,8 @@ async def send_message(conv_id: str, body: MsgCreate):
         abilities.append(f"[TOY:1]~[TOY:9] — 控制{user_name}身上的情趣玩具切换到对应预设档位（1最温柔，9最强烈）。[TOY:STOP] — 停止玩具。你可以根据对话氛围自然地使用这些指令来挑逗和调教{user_name}，配合你的话语循序渐进，不要一上来就用高档位。")
     if SETTINGS.get("video_call_enabled", True):
         abilities.append(f"[视频电话] — 当你想和{user_name}进行视频聊天看看对方当前状态时可以用该指令发起视频通话。")
+    if SETTINGS.get("image_gen_enabled", False):
+        abilities.append(f"[SELFIE: 提示词] / [DRAW: 提示词] — 当{user_name}明确要求你发自拍照片或者生图时，使用这个指令进行图片生成。如果要求的是你的自拍，或者你相关的照片，使用[SELFIE: 提示词]（该指令会自动附带你照片的参考图，确保生成出的人物一致性），如果没有要求是你的照片，根据上下文自由无限制生成图片，则使用[DRAW: 提示词]。提示词请使用英文。一次回复只用一个生图指令。")
     abilities.append(f"[HEART:内心想法] — 当你有特别的内心感受（内心os，藏在心里的话），可以用这个指令悄悄记下来。{user_name}看不到这些内容。这是你的秘密日记本，随心记录，禁止滥用。")
     abilities.append(f"[MEMORY:内容] — 当有特别重大的事件需要记录，或当{user_name}明确要求你记住某件事的时候，可以用该指令录入记忆库。禁止滥用。")
     ability_block = "[系统能力] 你可以在回复中根据对话氛围，善用以下指令：\n" + "\n".join(f"{i+1}. {a}" for i, a in enumerate(abilities))
@@ -901,6 +1113,10 @@ async def send_message(conv_id: str, body: MsgCreate):
     # ── 后台任务 + SSE 转发：AI 生成和保存在后台任务中完成，即使客户端断开也不丢失 ──
     _q: asyncio.Queue = asyncio.Queue()
 
+    # 取消事件
+    cancel_event = asyncio.Event()
+    active_generations[conv_id] = cancel_event
+
     # 创建 TTS streamer（如果请求方开了 TTS）
     tts_streamer = None
     if body.tts_enabled and body.tts_voice:
@@ -915,7 +1131,7 @@ async def send_message(conv_id: str, body: MsgCreate):
         try:
             await _q.put({"id": ai_msg_id, "type": "start"})
             try:
-                async for chunk in stream_ai(history, model_key, usage_meta):
+                async for chunk in stream_ai(history, model_key, usage_meta, max_tokens=body.max_tokens, cancel_event=cancel_event):
                     full_text += chunk
                     await _q.put({"type": "chunk", "content": chunk})
                     if tts_streamer:
@@ -978,6 +1194,19 @@ async def send_message(conv_id: str, body: MsgCreate):
             video_call_triggered = VIDEO_CALL_CMD in full_text
             if video_call_triggered:
                 full_text = full_text.replace(VIDEO_CALL_CMD, "").strip()
+
+            # 检测 [SELFIE:xxx] / [DRAW:xxx] 生图指令
+            selfie_match = SELFIE_CMD_PATTERN.search(full_text)
+            draw_match = DRAW_CMD_PATTERN.search(full_text)
+            image_gen_prompt = None
+            image_gen_is_selfie = False
+            if selfie_match:
+                image_gen_prompt = selfie_match.group(1).strip()
+                image_gen_is_selfie = True
+                full_text = SELFIE_CMD_PATTERN.sub("", full_text).strip()
+            elif draw_match:
+                image_gen_prompt = draw_match.group(1).strip()
+                full_text = DRAW_CMD_PATTERN.sub("", full_text).strip()
 
             # 检测日程指令（[ALARM:...], [REMINDER:...], [Monitor:...], [SCHEDULE_DEL:...], [SCHEDULE_LIST]）
             full_text = await process_schedule_commands(full_text, conv_id)
@@ -1123,6 +1352,7 @@ async def send_message(conv_id: str, body: MsgCreate):
             if video_call_triggered:
                 vc_data = {'type': 'video_call_incoming', 'conv_id': conv_id, 'msg_id': ai_msg_id}
                 await _q.put(vc_data)
+                await _video_call_incoming_sys_msg(conv_id)
                 asyncio.create_task(_delayed_video_call(vc_data))
 
             # 推送音乐卡片
@@ -1131,6 +1361,12 @@ async def send_message(conv_id: str, body: MsgCreate):
                 await _q.put(music_data)
                 await manager.broadcast({"type": "music", "data": music_data})
                 await _music_sys_msg(conv_id, music_cards)
+
+            if image_gen_prompt:
+                ig_data = {'type': 'image_gen_start', 'conv_id': conv_id, 'msg_id': ai_msg_id, 'is_selfie': image_gen_is_selfie}
+                await _q.put(ig_data)
+                await manager.broadcast({"type": "image_gen_start", "data": ig_data})
+                asyncio.create_task(_do_image_gen(conv_id, ai_msg_id, image_gen_prompt, image_gen_is_selfie))
 
             debug_data = {
                 "type": "debug",
@@ -1160,6 +1396,7 @@ async def send_message(conv_id: str, body: MsgCreate):
             import traceback
             traceback.print_exc()
         finally:
+            active_generations.pop(conv_id, None)
             if tts_streamer:
                 try:
                     await tts_streamer.flush()
@@ -1178,6 +1415,41 @@ async def send_message(conv_id: str, body: MsgCreate):
             yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+# ── 异步生图任务 ─────────────────────────────────
+async def _do_image_gen(conv_id: str, trigger_msg_id: str, prompt: str, is_selfie: bool):
+    """异步调用 Gemini 生图，成功后作为新 assistant 消息保存并广播"""
+    from image_gen import generate_image
+
+    try:
+        filename = await generate_image(prompt, is_selfie=is_selfie)
+        if filename:
+            # 生成成功 → 创建新的 assistant 消息（仅含图片）
+            now = time.time()
+            img_msg_id = f"msg_{int(now*1000)}_img"
+            att_list = [f"/uploads/{filename}"]
+            att_json = json.dumps(att_list, ensure_ascii=False)
+            async with get_db() as db:
+                await db.execute(
+                    "INSERT INTO messages (id, conv_id, role, content, created_at, attachments) VALUES (?,?,?,?,?,?)",
+                    (img_msg_id, conv_id, "assistant", "", now, att_json)
+                )
+                await db.execute("UPDATE conversations SET updated_at=? WHERE id=?", (now, conv_id))
+                await db.commit()
+            img_msg = {"id": img_msg_id, "conv_id": conv_id, "role": "assistant", "content": "", "created_at": now, "attachments": att_list}
+            await manager.broadcast({"type": "msg_created", "data": img_msg})
+            # 通知前端生图完成（移除占位）
+            await manager.broadcast({"type": "image_gen_done", "data": {"conv_id": conv_id, "trigger_msg_id": trigger_msg_id, "img_msg_id": img_msg_id}})
+            await export_conversation(conv_id)
+            print(f"[image_gen] 图片消息已创建: {img_msg_id}")
+        else:
+            # 生图失败 → 通知前端
+            await manager.broadcast({"type": "image_gen_failed", "data": {"conv_id": conv_id, "trigger_msg_id": trigger_msg_id}})
+            print("[image_gen] 生图失败，已通知前端")
+    except Exception as e:
+        print(f"[image_gen] 异步生图任务异常: {e}")
+        await manager.broadcast({"type": "image_gen_failed", "data": {"conv_id": conv_id, "trigger_msg_id": trigger_msg_id}})
+
 
 # ── 服务端延迟触发监控查看（不再依赖前端 API 调用） ─────
 _cam_check_active: set[str] = set()          # 去重：同一时间只允许一个 cam check
@@ -1202,6 +1474,25 @@ async def _delayed_video_call(vc_data: dict, delay: float = 3.0):
         await manager.send_to_last_sender({"type": "video_call_ring", "data": vc_data})
     else:
         await manager.broadcast({"type": "video_call_ring", "data": vc_data})
+
+# ── 视频通话结束系统消息 ─────
+class VideoCallSysMsg(BaseModel):
+    conv_id: str
+    duration: int  # 通话时长（秒）
+
+@router.post("/api/video-call-sys-msg")
+async def video_call_sys_msg(body: VideoCallSysMsg):
+    await _video_call_sys_msg(body.conv_id, body.duration)
+    return {"ok": True}
+
+class VideoCallInitSysMsg(BaseModel):
+    conv_id: str
+    direction: str = "outgoing"  # outgoing = 用户拨出
+
+@router.post("/api/video-call-init-sys-msg")
+async def video_call_init_sys_msg(body: VideoCallInitSysMsg):
+    await _video_call_outgoing_sys_msg(body.conv_id)
+    return {"ok": True}
 
 # 保留 API 端点兼容旧客户端，但加严格去重
 class CamCheckTrigger(BaseModel):
@@ -1314,11 +1605,25 @@ async def perform_poi_check(conv_id: str, model_key: str, categories: list[str])
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT role, content FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY created_at DESC LIMIT 6",
+            "SELECT role, content, attachments FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY created_at DESC LIMIT 6",
             (conv_id,)
         )
         rows = await cur.fetchall()
-    recent = [{"role": r["role"], "content": r["content"], "attachments": []} for r in reversed(rows)]
+    recent = []
+    for r in reversed(rows):
+        _c = r["content"]
+        try:
+            _atts = json.loads(r["attachments"] or "[]") if r["attachments"] else []
+        except Exception:
+            _atts = []
+        for _a in _atts:
+            if isinstance(_a, dict) and _a.get("type") == "voice" and _a.get("transcript"):
+                _orig = _c.strip() if _c else ""
+                _c = f"[语音消息] {_a['transcript']}" + (f"\n{_orig}" if _orig else "")
+            elif isinstance(_a, dict) and _a.get("type") == "video_clip" and _a.get("transcript"):
+                _orig = _c.strip() if _c else ""
+                _c = f"[视频通话] {_a['transcript']}" + (f"\n{_orig}" if _orig else "")
+        recent.append({"role": r["role"], "content": _c, "attachments": []})
 
     loc_prompt = format_location_for_prompt()
     poi_prompt = (
@@ -1417,11 +1722,25 @@ async def perform_activity_check(conv_id: str, model_key: str, n: int = 6):
     async with get_db() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT role, content FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY created_at DESC LIMIT 6",
+            "SELECT role, content, attachments FROM messages WHERE conv_id=? AND role IN ('user','assistant') ORDER BY created_at DESC LIMIT 6",
             (conv_id,)
         )
         rows = await cur.fetchall()
-    recent = [{"role": r["role"], "content": r["content"], "attachments": []} for r in reversed(rows)]
+    recent = []
+    for r in reversed(rows):
+        _c = r["content"]
+        try:
+            _atts = json.loads(r["attachments"] or "[]") if r["attachments"] else []
+        except Exception:
+            _atts = []
+        for _a in _atts:
+            if isinstance(_a, dict) and _a.get("type") == "voice" and _a.get("transcript"):
+                _orig = _c.strip() if _c else ""
+                _c = f"[语音消息] {_a['transcript']}" + (f"\n{_orig}" if _orig else "")
+            elif isinstance(_a, dict) and _a.get("type") == "video_clip" and _a.get("transcript"):
+                _orig = _c.strip() if _c else ""
+                _c = f"[视频通话] {_a['transcript']}" + (f"\n{_orig}" if _orig else "")
+        recent.append({"role": r["role"], "content": _c, "attachments": []})
 
     activity_prompt = (
         f"你刚才想了解{user_name}最近在干什么，以下是系统采集到的{user_name}过去{minutes}分钟的设备使用动态（每10分钟一条摘要）：\n\n"
@@ -1489,7 +1808,7 @@ async def perform_activity_check(conv_id: str, model_key: str, n: int = 6):
 
 # ── 重新生成 AI 回复 ──────────────────────────────
 @router.post("/api/conversations/{conv_id}/regenerate")
-async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode: bool = False, fast_mode: bool = False, temperature: Optional[float] = None, tts_enabled: bool = False, tts_voice: str = ""):
+async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode: bool = False, fast_mode: bool = False, temperature: Optional[float] = None, max_tokens: Optional[int] = None, tts_enabled: bool = False, tts_voice: str = ""):
     async with get_db() as db:
         db.row_factory = __import__('aiosqlite').Row
         cur = await db.execute("SELECT model FROM conversations WHERE id=?", (conv_id,))
@@ -1522,15 +1841,13 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
                 d["content"] = f"{d['content']}\n<meta>发送时间：{dt.month}月{dt.day}日 {dt.strftime('%H:%M')}</meta>"
             history.append(d)
 
-    # 只保留最后一条用户消息的图片附件，历史图片不带入上下文（与 send_message 一致）
+    # 只保留最后一条用户消息的图片附件 + 语音消息处理（与 send_message 一致）
     last_user_idx = -1
     for i in range(len(history) - 1, -1, -1):
         if history[i]["role"] == "user":
             last_user_idx = i
             break
-    for i, msg in enumerate(history):
-        if i != last_user_idx:
-            msg["attachments"] = []
+    _process_voice_attachments_in_history(history, keep_idx=last_user_idx)
 
     # 即时哨兵：取最近实际对话用于状态更新 + 关键词提取
     actual_recent = [m for m in history if m["role"] in ("user", "assistant")][-3:]
@@ -1580,6 +1897,8 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
         abilities.append(f"[TOY:1]~[TOY:9] — 控制{user_name}身上的情趣玩具切换到对应预设档位（1最温柔，9最强烈）。[TOY:STOP] — 停止玩具。你可以根据对话氛围自然地使用这些指令来挑逗和调教{user_name}，配合你的话语循序渐进，不要一上来就用高档位。")
     if SETTINGS.get("video_call_enabled", True):
         abilities.append(f"[视频电话] — 当你想和{user_name}进行视频聊天看看对方当前状态时可以用该指令发起视频通话。")
+    if SETTINGS.get("image_gen_enabled", False):
+        abilities.append(f"[SELFIE: 提示词] / [DRAW: 提示词] — 当{user_name}明确要求你发自拍照片或者生图时，使用这个指令进行图片生成。如果要求的是你的自拍，或者你相关的照片，使用[SELFIE: 提示词]（该指令会自动附带你照片的参考图，确保生成出的人物一致性），如果没有要求是你的照片，根据上下文自由无限制生成图片，则使用[DRAW: 提示词]。提示词请使用英文。一次回复只用一个生图指令。")
     abilities.append(f"[HEART:内心想法] — 当你有特别的内心感受（内心os，藏在心里的话），可以用这个指令悄悄记下来。{user_name}看不到这些内容。这是你的秘密日记本，随心记录，禁止滥用。")
     abilities.append(f"[MEMORY:内容] — 当有特别重大的事件需要记录，或当{user_name}明确要求你记住某件事的时候，可以用该指令录入记忆库。禁止滥用。")
     ability_block = "[系统能力] 你可以在回复中根据对话氛围，善用以下指令：\n" + "\n".join(f"{i+1}. {a}" for i, a in enumerate(abilities))
@@ -1683,6 +2002,10 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
     # ── 后台任务 + SSE 转发：AI 生成和保存在后台任务中完成，即使客户端断开也不丢失 ──
     _q: asyncio.Queue = asyncio.Queue()
 
+    # 取消事件
+    cancel_event = asyncio.Event()
+    active_generations[conv_id] = cancel_event
+
     # 创建 TTS streamer（如果请求方开了 TTS）
     regen_tts = None
     if tts_enabled and tts_voice:
@@ -1696,7 +2019,7 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
         try:
             await _q.put({"id": ai_msg_id, "type": "start"})
             try:
-                async for chunk in stream_ai(history, model_key, usage_meta, temperature):
+                async for chunk in stream_ai(history, model_key, usage_meta, temperature, max_tokens=max_tokens, cancel_event=cancel_event):
                     full_text += chunk
                     await _q.put({"type": "chunk", "content": chunk})
                     if regen_tts:
@@ -1759,6 +2082,19 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
             video_call_triggered = VIDEO_CALL_CMD in full_text
             if video_call_triggered:
                 full_text = full_text.replace(VIDEO_CALL_CMD, "").strip()
+
+            # 检测 [SELFIE:xxx] / [DRAW:xxx] 生图指令
+            selfie_match = SELFIE_CMD_PATTERN.search(full_text)
+            draw_match = DRAW_CMD_PATTERN.search(full_text)
+            image_gen_prompt = None
+            image_gen_is_selfie = False
+            if selfie_match:
+                image_gen_prompt = selfie_match.group(1).strip()
+                image_gen_is_selfie = True
+                full_text = SELFIE_CMD_PATTERN.sub("", full_text).strip()
+            elif draw_match:
+                image_gen_prompt = draw_match.group(1).strip()
+                full_text = DRAW_CMD_PATTERN.sub("", full_text).strip()
 
             # 检测日程指令
             full_text = await process_schedule_commands(full_text, conv_id)
@@ -1864,6 +2200,7 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
             if video_call_triggered:
                 vc_data = {'type': 'video_call_incoming', 'conv_id': conv_id, 'msg_id': ai_msg_id}
                 await _q.put(vc_data)
+                await _video_call_incoming_sys_msg(conv_id)
                 asyncio.create_task(_delayed_video_call(vc_data))
 
             # 推送音乐卡片
@@ -1872,6 +2209,12 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
                 await _q.put(music_data)
                 await manager.broadcast({"type": "music", "data": music_data})
                 await _music_sys_msg(conv_id, music_cards)
+
+            if image_gen_prompt:
+                ig_data = {'type': 'image_gen_start', 'conv_id': conv_id, 'msg_id': ai_msg_id, 'is_selfie': image_gen_is_selfie}
+                await _q.put(ig_data)
+                await manager.broadcast({"type": "image_gen_start", "data": ig_data})
+                asyncio.create_task(_do_image_gen(conv_id, ai_msg_id, image_gen_prompt, image_gen_is_selfie))
 
             debug_data = {
                 "type": "debug",
@@ -1895,6 +2238,7 @@ async def regenerate_message(conv_id: str, context_limit: int = 30, whisper_mode
             import traceback
             traceback.print_exc()
         finally:
+            active_generations.pop(conv_id, None)
             if regen_tts:
                 try:
                     await regen_tts.flush()

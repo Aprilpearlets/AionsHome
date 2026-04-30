@@ -94,6 +94,20 @@ async def update_video_call_setting(body: VideoCallToggle):
     save_settings(SETTINGS)
     return {"ok": True, "video_call_enabled": body.enabled}
 
+# ── AI 生图开关 ───────────────────────────────────
+@router.get("/api/settings/image-gen")
+async def get_image_gen_setting():
+    return {"image_gen_enabled": SETTINGS.get("image_gen_enabled", False)}
+
+class ImageGenToggle(BaseModel):
+    enabled: bool
+
+@router.put("/api/settings/image-gen")
+async def update_image_gen_setting(body: ImageGenToggle):
+    SETTINGS["image_gen_enabled"] = body.enabled
+    save_settings(SETTINGS)
+    return {"ok": True, "image_gen_enabled": body.enabled}
+
 # ── 世界书 ────────────────────────────────────────
 class WorldBookUpdate(BaseModel):
     ai_persona: str = ""

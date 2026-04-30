@@ -18,24 +18,30 @@ const videoCall = (() => {
   let _useNativeCamera = false; // 是否使用原生摄像头桥接
   let _nativeCamTimer = null;   // 原生摄像头 rAF ID
 
-  // ── 语音状态 ──
+  // ── 语音/录制状态 ──
   let _voiceStream = null;
   let _voiceCtx = null;
   let _voiceProcessor = null;
   let _sampleRate = 48000;
   let _useNativeAudio = false;
-  let _ownNativeBridge = false;  // true = 我们启动的桥接，false = 复用语音唤醒的
-  let _frames = [];
-  let _speechN = 0;
-  let _silenceN = 0;
-  let _isRecording = false;
-  let _waitN = 0;
-  let _processing = false;
-  let _noiseFloor = 0.005;
-  let _calibFrames = [];
-  let _calibrated = false;
+  let _ownNativeBridge = false;
   let _aiSpeaking = false;
-  let _listeningEnabled = false;
+  let _callStartTime = 0;
+
+  // ── 视频录制状态 ──
+  let _videoRecording = false;    // 是否正在录制视频
+  let _videoRecorder = null;      // 浏览器 MediaRecorder（视频+音频）
+  let _audioForASR = null;        // 浏览器 MediaRecorder（纯音频，用于 ASR）
+  let _videoChunks = [];
+  let _audioChunks = [];
+  let _nativeAudioFrames = [];    // Android 原生桥接录制期间收集的 PCM base64 帧
+  let _recordStartTime = 0;
+  let _recordTimerEl = null;
+  let _recordTimerInterval = null;
+  let _processing = false;        // 是否正在处理发送
+  let _lastInteractionTime = 0;   // 最后交互时间（用于不活跃超时）
+  let _inactivityTimer = null;
+  const MAX_RECORD_SECONDS = 60;
 
   // ── 获取 AI 名称 ──
   function _getAiName() {
@@ -230,7 +236,7 @@ const videoCall = (() => {
     _overlay.appendChild(statusBar);
 
     // 底部按钮栏
-    const bottomBar = _createElement('div', {}, {
+    const bottomBar = _createElement('div', { id: 'vcBottomBar' }, {
       position: 'absolute', bottom: '40px', left: 0, width: '100%',
       display: 'flex', justifyContent: 'center', alignItems: 'center',
       gap: '40px', zIndex: 3
@@ -248,6 +254,17 @@ const videoCall = (() => {
     flipBtn.onclick = () => _flipCamera();
     _overlay.appendChild(flipBtn);
 
+    // 按住录制按钮（居中，最大）
+    const recordBtn = _createElement('div', { id: 'vcRecordBtn' }, {
+      width: '72px', height: '72px', borderRadius: '50%',
+      background: 'rgba(255,255,255,0.15)', border: '3px solid rgba(255,255,255,0.6)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      cursor: 'pointer', flexDirection: 'column', userSelect: 'none',
+      WebkitUserSelect: 'none', touchAction: 'none', transition: 'all 0.15s'
+    });
+    recordBtn.innerHTML = '<span style="font-size:28px;line-height:1">🎙</span><span style="font-size:10px;color:#fff;margin-top:2px">按住录制</span>';
+    bottomBar.appendChild(recordBtn);
+
     // 挂断按钮
     const hangupBtn = _createElement('div', {}, {
       display: 'flex', flexDirection: 'column', alignItems: 'center', cursor: 'pointer'
@@ -263,6 +280,53 @@ const videoCall = (() => {
     hangupBtn.onclick = () => _hangup();
     bottomBar.appendChild(hangupBtn);
     _overlay.appendChild(bottomBar);
+
+    // 录制浮层（录制中显示计时器 + 垃圾桶取消区）
+    const recordOverlay = _createElement('div', { id: 'vcRecordOverlay' }, {
+      position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+      zIndex: 4, display: 'none', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'flex-end',
+      background: 'rgba(0,0,0,0.3)', pointerEvents: 'none'
+    });
+    // 计时器
+    const recTimer = _createElement('div', { id: 'vcRecTimer' }, {
+      color: '#fff', fontSize: '18px', fontWeight: '500',
+      background: 'rgba(220,50,50,0.7)', padding: '4px 16px',
+      borderRadius: '16px', position: 'absolute', top: '60px',
+      display: 'flex', alignItems: 'center', gap: '6px'
+    });
+    recTimer.innerHTML = '<span style="width:8px;height:8px;border-radius:50%;background:#ff4444;animation:vcRecDot 1s infinite"></span> 0:00';
+    recordOverlay.appendChild(recTimer);
+    // 上滑取消提示
+    const cancelHint = _createElement('div', { id: 'vcCancelHint' }, {
+      color: 'rgba(255,255,255,0.7)', fontSize: '13px',
+      marginBottom: '140px', transition: 'all 0.2s'
+    });
+    cancelHint.textContent = '↑ 上滑取消';
+    recordOverlay.appendChild(cancelHint);
+    // 垃圾桶取消区
+    const trashZone = _createElement('div', { id: 'vcTrashZone' }, {
+      position: 'absolute', top: 0, left: 0, width: '100%', height: '35%',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontSize: '40px', opacity: 0, transition: 'opacity 0.2s'
+    });
+    trashZone.textContent = '🗑';
+    recordOverlay.appendChild(trashZone);
+    _overlay.appendChild(recordOverlay);
+
+    // CSS 动画
+    if (!document.getElementById('vcRecStyles')) {
+      const s = document.createElement('style');
+      s.id = 'vcRecStyles';
+      s.textContent = `
+        @keyframes vcRecDot { 0%,100%{opacity:1} 50%{opacity:0.3} }
+        #vcRecordBtn.recording { background: rgba(220,50,50,0.6) !important; border-color: #ff4444 !important; transform: scale(1.1); }
+        #vcRecordBtn.disabled { opacity: 0.4; pointer-events: none; }
+        #vcTrashZone.active { opacity: 1 !important; background: rgba(220,50,50,0.3); }
+        #vcCancelHint.in-trash { color: #ff4444 !important; font-weight: 600; }
+      `;
+      document.head.appendChild(s);
+    }
 
     document.body.appendChild(_overlay);
 
@@ -402,53 +466,59 @@ const videoCall = (() => {
     }
   }
 
-  // ── 截图 ──
-  function _captureScreenshot() {
-    // 原生摄像头桥接 — 直接返回高质量帧
-    if (_useNativeCamera && window.AionCamera) {
-      const b64 = window.AionCamera.capture();
-      return b64 ? 'data:image/jpeg;base64,' + b64 : null;
+  // ── 录制按钮交互 ──
+  function _initRecordButton() {
+    const btn = document.getElementById('vcRecordBtn');
+    if (!btn) return;
+    let _inTrash = false;
+    let _startY = 0;
+
+    function onDown(e) {
+      if (_aiSpeaking || _processing || _videoRecording) return;
+      e.preventDefault();
+      _startY = (e.touches ? e.touches[0].clientY : e.clientY);
+      _inTrash = false;
+      _startRecord();
     }
-    // getUserMedia 模式 — 从 video 元素截图
-    if (!_cameraStream) return null;
-    const track = _cameraStream.getVideoTracks()[0];
-    if (!track) return null;
-    const settings = track.getSettings();
-    const w = settings.width || 640;
-    const h = settings.height || 480;
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
-    const ctx = canvas.getContext('2d');
+    function onMove(e) {
+      if (!_videoRecording) return;
+      e.preventDefault();
+      const y = (e.touches ? e.touches[0].clientY : e.clientY);
+      const dy = _startY - y;
+      const overlay = document.getElementById('vcRecordOverlay');
+      const trash = document.getElementById('vcTrashZone');
+      const hint = document.getElementById('vcCancelHint');
+      _inTrash = dy > 120;
+      if (trash) trash.classList.toggle('active', _inTrash);
+      if (hint) hint.classList.toggle('in-trash', _inTrash);
+      if (hint) hint.textContent = _inTrash ? '松手取消' : '↑ 上滑取消';
+    }
+    function onUp(e) {
+      if (!_videoRecording) return;
+      e.preventDefault();
+      if (_inTrash) {
+        _cancelRecord();
+      } else {
+        _stopRecord();
+      }
+    }
 
-    const videoEl = _swapped
-      ? document.getElementById('vcMainVideo')
-      : document.getElementById('vcUserVideo');
-    if (!videoEl) return null;
-
-    ctx.drawImage(videoEl, 0, 0, w, h);
-    return canvas.toDataURL('image/jpeg', 0.8);
+    btn.addEventListener('mousedown', onDown);
+    btn.addEventListener('touchstart', onDown, { passive: false });
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('touchmove', onMove, { passive: false });
+    document.addEventListener('mouseup', onUp);
+    document.addEventListener('touchend', onUp);
   }
 
-  // ── 语音监听 ──
-  function _startVoiceListening() {
-    _listeningEnabled = true;
-    _aiSpeaking = false;
-    _processing = false;
-    _calibrated = false;
-    _calibFrames = [];
-    _resetVAD();
-
-    // 优先用 Android 原生桥接
+  // ── 启动音频流（简化版，只为录制服务） ──
+  function _startAudioStream() {
+    // Android 原生桥接
     if (window.AionAudio) {
-      // 如果桥接已在录音（语音唤醒正在用），直接复用，数据会推给 _onNativeChunk
       if (window.AionAudio.isRecording()) {
         _useNativeAudio = true;
         _ownNativeBridge = false;
         _sampleRate = 16000;
-        _listeningEnabled = true;
-        console.log('[VideoCall] Voice reusing existing native bridge');
-        _updateStatus('聆听中...');
         return;
       }
       const ok = window.AionAudio.start();
@@ -456,34 +526,22 @@ const videoCall = (() => {
         _useNativeAudio = true;
         _ownNativeBridge = true;
         _sampleRate = 16000;
-        _listeningEnabled = true;
-        console.log('[VideoCall] Voice started with native bridge');
-        _updateStatus('聆听中...');
         return;
       }
     }
-
-    // 回退到 getUserMedia（复用摄像头的 audio）
+    // getUserMedia
     navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     }).then(stream => {
       _voiceStream = stream;
-      _voiceCtx = new (window.AudioContext || window.webkitAudioContext)();
-      _sampleRate = _voiceCtx.sampleRate;
-      const source = _voiceCtx.createMediaStreamSource(stream);
-      _voiceProcessor = _voiceCtx.createScriptProcessor(2048, 1, 1);
-      _voiceProcessor.onaudioprocess = (e) => _onAudioFrame(e.inputBuffer.getChannelData(0));
-      source.connect(_voiceProcessor);
-      _voiceProcessor.connect(_voiceCtx.destination);
-      console.log(`[VideoCall] Voice started with getUserMedia, sr=${_sampleRate}`);
+      _sampleRate = 48000;
+      console.log('[VideoCall] Audio stream ready');
     }).catch(e => {
       console.error('[VideoCall] Microphone unavailable:', e);
-      _updateStatus('麦克风不可用');
     });
   }
 
-  function _stopVoiceListening() {
-    _listeningEnabled = false;
+  function _stopAudioStream() {
     if (_useNativeAudio && window.AionAudio && _ownNativeBridge) {
       window.AionAudio.stop();
     }
@@ -494,167 +552,322 @@ const videoCall = (() => {
     if (_voiceStream) { _voiceStream.getTracks().forEach(t => t.stop()); _voiceStream = null; }
   }
 
-  function _resetVAD() {
-    _frames = [];
-    _speechN = 0;
-    _silenceN = 0;
-    _isRecording = false;
-    _waitN = 0;
-  }
+  // ── 视频录制 ──
+  function _startRecord() {
+    if (_videoRecording) return;
+    _videoRecording = true;
+    _videoChunks = [];
+    _audioChunks = [];
+    _nativeAudioFrames = [];
+    _recordStartTime = Date.now();
 
-  // Android 原生桥接推送的音频帧
-  function _onNativeChunk(b64) {
-    if (!_listeningEnabled || _processing) return;
-    const binary = atob(b64);
-    const len = binary.length / 2;
-    const float32 = new Float32Array(len);
-    for (let i = 0; i < len; i++) {
-      const lo = binary.charCodeAt(i * 2);
-      const hi = binary.charCodeAt(i * 2 + 1);
-      const int16 = (hi << 8) | lo;
-      float32[i] = int16 >= 32768 ? (int16 - 65536) / 32768 : int16 / 32768;
-    }
-    _onAudioFrame(float32);
-  }
+    // UI
+    const btn = document.getElementById('vcRecordBtn');
+    if (btn) btn.classList.add('recording');
+    const overlay = document.getElementById('vcRecordOverlay');
+    if (overlay) overlay.style.display = 'flex';
+    _updateRecordTimer();
+    _recordTimerInterval = setInterval(_updateRecordTimer, 1000);
+    _updateStatus('录制中...');
 
-  function _onAudioFrame(input) {
-    if (!_listeningEnabled || _processing) return;
-    const energy = input.reduce((s, v) => s + Math.abs(v), 0) / input.length;
-
-    // 校准
-    if (!_calibrated) {
-      _calibFrames.push(energy);
-      if (_calibFrames.length >= 20) {
-        const avg = _calibFrames.reduce((a, b) => a + b, 0) / _calibFrames.length;
-        _noiseFloor = Math.max(avg * 2.5, 0.003);
-        _calibrated = true;
-        _updateStatus('聆听中...');
-        console.log(`[VideoCall] Calibrated: noiseFloor=${_noiseFloor.toFixed(5)}`);
+    if (_useNativeCamera && window.AionVideo) {
+      // ── Android 原生录制 ──
+      // AionVideo 复用 CameraBridge + AudioBridge 的帧
+      const w = window.AionCamera ? window.AionCamera.getRotatedWidth() : 480;
+      const h = window.AionCamera ? window.AionCamera.getRotatedHeight() : 640;
+      const ok = window.AionVideo.startRecord(w, h);
+      if (!ok) {
+        console.error('[VideoCall] AionVideo.startRecord failed');
+        _cancelRecord();
+        return;
       }
+      console.log(`[VideoCall] Native recording started ${w}x${h}`);
+    } else {
+      // ── 浏览器 MediaRecorder ──
+      try {
+        // 合并视频流 + 音频流
+        const tracks = [];
+        if (_cameraStream) tracks.push(..._cameraStream.getVideoTracks());
+        if (_voiceStream) tracks.push(..._voiceStream.getAudioTracks());
+
+        if (tracks.length === 0) {
+          console.error('[VideoCall] No tracks for recording');
+          _cancelRecord();
+          return;
+        }
+
+        const combined = new MediaStream(tracks);
+        _videoRecorder = new MediaRecorder(combined, {
+          mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+            ? 'video/webm;codecs=vp9,opus'
+            : 'video/webm'
+        });
+        _videoRecorder.ondataavailable = (e) => { if (e.data.size > 0) _videoChunks.push(e.data); };
+        _videoRecorder.start(500);
+
+        // 同时录纯音频（用于 ASR）
+        if (_voiceStream && _voiceStream.getAudioTracks().length > 0) {
+          const audioStream = new MediaStream(_voiceStream.getAudioTracks());
+          _audioForASR = new MediaRecorder(audioStream, {
+            mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+              ? 'audio/webm;codecs=opus' : 'audio/webm'
+          });
+          _audioForASR.ondataavailable = (e) => { if (e.data.size > 0) _audioChunks.push(e.data); };
+          _audioForASR.start(500);
+        }
+
+        console.log('[VideoCall] Browser recording started');
+      } catch (e) {
+        console.error('[VideoCall] MediaRecorder error:', e);
+        _cancelRecord();
+        return;
+      }
+    }
+
+    // 最长录制时间限制
+    setTimeout(() => {
+      if (_videoRecording) {
+        console.log('[VideoCall] Max record time reached');
+        _stopRecord();
+      }
+    }, MAX_RECORD_SECONDS * 1000);
+  }
+
+  async function _stopRecord() {
+    if (!_videoRecording) return;
+    _videoRecording = false;
+    _clearRecordUI();
+
+    const duration = (Date.now() - _recordStartTime) / 1000;
+    if (duration < 0.5) {
+      _updateStatus('录制太短');
+      setTimeout(() => _updateStatus('等待录制...'), 1500);
       return;
     }
 
-    if (_aiSpeaking) { _resetVAD(); return; }
-
-    const isSpeech = energy > _noiseFloor;
-    const silenceLimit = 35;  // ~1.5s
-    const waitLimit = 1400;   // ~60s 超时
-
-    if (!_isRecording) {
-      if (isSpeech) {
-        _speechN++;
-        _frames.push(new Float32Array(input));
-        if (_speechN >= 8) {
-          _isRecording = true;
-          _silenceN = 0;
-          _updateStatus('正在录音...');
-        }
-      } else {
-        _speechN = 0;
-        _frames = [];
-        _waitN++;
-        if (_waitN > waitLimit) {
-          // 60s 超时 — 挂断
-          _hangup();
-          return;
-        }
-      }
-    } else {
-      _frames.push(new Float32Array(input));
-      if (!isSpeech) {
-        _silenceN++;
-        if (_silenceN > silenceLimit) {
-          _processAudio();
-        }
-      } else {
-        _silenceN = 0;
-      }
-      // 最长 30 秒
-      const frameSize = _useNativeAudio ? 640 : 2048;
-      if (_frames.length > Math.ceil(30 * _sampleRate / frameSize)) {
-        _processAudio();
-      }
-    }
-  }
-
-  async function _processAudio() {
-    if (_processing) return;
     _processing = true;
-
-    const frames = _frames;
-    _resetVAD();
-
-    // 合并帧
-    const total = frames.reduce((s, f) => s + f.length, 0);
-    const audio = new Float32Array(total);
-    let offset = 0;
-    for (const f of frames) { audio.set(f, offset); offset += f.length; }
-
-    const duration = total / _sampleRate;
-    console.log(`[VideoCall] Recorded ${duration.toFixed(1)}s`);
-    if (duration < 0.3) { _processing = false; return; }
-
-    // 转 WAV
-    const wav = _encodeWAV(audio);
-    _updateStatus('识别中...');
+    _updateStatus('处理中...');
+    _setRecordBtnDisabled(true);
 
     try {
-      const form = new FormData();
-      form.append('file', new Blob([wav], { type: 'audio/wav' }), 'audio.wav');
-      const resp = await fetch('/api/voice/remote-asr', { method: 'POST', body: form });
-      const data = await resp.json();
-      const text = (data.text || '').trim();
-      console.log(`[VideoCall] ASR: "${text}"`);
+      let videoBlob, audioBlob;
 
-      if (!text) {
+      if (_useNativeCamera && window.AionVideo) {
+        // ── Android：停止录制，获取 MP4 base64 ──
+        const b64 = window.AionVideo.stopRecord();
+        if (!b64) { _processing = false; _setRecordBtnDisabled(false); return; }
+        const bin = atob(b64);
+        const arr = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+        videoBlob = new Blob([arr], { type: 'video/mp4' });
+
+        // 用收集的 PCM 帧构建 WAV
+        if (_nativeAudioFrames.length > 0) {
+          audioBlob = _buildWavFromNativeChunks(_nativeAudioFrames);
+          _nativeAudioFrames = [];
+        }
+      } else {
+        // ── 浏览器：停止 MediaRecorder ──
+        videoBlob = await _stopMediaRecorder(_videoRecorder, _videoChunks);
+        _videoRecorder = null;
+        audioBlob = await _stopMediaRecorder(_audioForASR, _audioChunks);
+        _audioForASR = null;
+      }
+
+      if (!videoBlob || videoBlob.size < 1000) {
         _processing = false;
-        _updateStatus('聆听中...');
+        _setRecordBtnDisabled(false);
+        _updateStatus('等待录制...');
         return;
+      }
+
+      // 上传视频
+      _updateStatus('上传中...');
+      const videoUrl = await _uploadFile(videoBlob, 'video_clip');
+      if (!videoUrl) {
+        _processing = false;
+        _setRecordBtnDisabled(false);
+        _updateStatus('上传失败');
+        return;
+      }
+
+      // ASR 转写
+      _updateStatus('识别中...');
+      let transcript = '';
+      if (audioBlob && audioBlob.size > 100) {
+        transcript = await _transcribeAudio(audioBlob);
       }
 
       // 检查挂断关键词
       const hangupWords = ['再见', '拜拜', '挂断', '结束通话', '挂了'];
-      if (hangupWords.some(kw => text.includes(kw))) {
-        await _sendToChat(text, null); // 挂断不截图
+      if (transcript && hangupWords.some(kw => transcript.includes(kw))) {
+        const att = { type: 'video_clip', url: videoUrl, duration: Math.round(duration), transcript };
+        await _sendToChat('', att);
         _hangup();
-        _processing = false;
         return;
       }
 
-      // 截图 + 发送
+      // 发送给模型
       _aiSpeaking = true;
       _updateStatus('AI 思考中...');
-      const screenshot = _captureScreenshot();
-      await _sendToChat(text, screenshot);
+      const att = { type: 'video_clip', url: videoUrl, duration: Math.round(duration), transcript };
+      await _sendToChat(transcript, att);
     } catch (e) {
-      console.error('[VideoCall] ASR error:', e);
-      _updateStatus('⚠ 识别出错');
+      console.error('[VideoCall] Record process error:', e);
+      _updateStatus('⚠ 处理出错');
+    } finally {
+      _processing = false;
+      _resetInactivityTimer();
     }
-
-    _processing = false;
   }
 
-  async function _sendToChat(text, screenshotDataUrl) {
+  function _cancelRecord() {
+    if (!_videoRecording && !_processing) return;
+    _videoRecording = false;
+    _clearRecordUI();
+
+    if (_useNativeCamera && window.AionVideo) {
+      window.AionVideo.cancel();
+    } else {
+      if (_videoRecorder && _videoRecorder.state !== 'inactive') _videoRecorder.stop();
+      if (_audioForASR && _audioForASR.state !== 'inactive') _audioForASR.stop();
+      _videoRecorder = null;
+      _audioForASR = null;
+    }
+    _videoChunks = [];
+    _audioChunks = [];
+    _nativeAudioFrames = [];
+    _updateStatus('已取消');
+    setTimeout(() => { if (_active && !_processing) _updateStatus('等待录制...'); }, 1000);
+    console.log('[VideoCall] Recording cancelled');
+  }
+
+  // ── 录制 UI 辅助 ──
+  function _clearRecordUI() {
+    const btn = document.getElementById('vcRecordBtn');
+    if (btn) btn.classList.remove('recording');
+    const overlay = document.getElementById('vcRecordOverlay');
+    if (overlay) overlay.style.display = 'none';
+    const trash = document.getElementById('vcTrashZone');
+    if (trash) trash.classList.remove('active');
+    const hint = document.getElementById('vcCancelHint');
+    if (hint) { hint.classList.remove('in-trash'); hint.textContent = '↑ 上滑取消'; }
+    if (_recordTimerInterval) { clearInterval(_recordTimerInterval); _recordTimerInterval = null; }
+  }
+
+  function _updateRecordTimer() {
+    const el = document.getElementById('vcRecTimer');
+    if (!el) return;
+    const sec = Math.floor((Date.now() - _recordStartTime) / 1000);
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    el.innerHTML = `<span style="width:8px;height:8px;border-radius:50%;background:#ff4444;animation:vcRecDot 1s infinite"></span> ${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function _setRecordBtnDisabled(disabled) {
+    const btn = document.getElementById('vcRecordBtn');
+    if (btn) btn.classList.toggle('disabled', disabled);
+  }
+
+  // ── MediaRecorder 停止并返回 Blob ──
+  function _stopMediaRecorder(recorder, chunks) {
+    return new Promise(resolve => {
+      if (!recorder || recorder.state === 'inactive') {
+        resolve(chunks.length > 0 ? new Blob(chunks, { type: chunks[0].type }) : null);
+        return;
+      }
+      recorder.onstop = () => {
+        resolve(chunks.length > 0 ? new Blob(chunks, { type: chunks[0].type }) : null);
+      };
+      recorder.stop();
+    });
+  }
+
+  // ── 上传文件 ──
+  async function _uploadFile(blob, prefix) {
+    try {
+      const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+      const form = new FormData();
+      form.append('file', blob, `${prefix}_${Date.now()}.${ext}`);
+      const resp = await fetch('/api/upload', { method: 'POST', body: form });
+      const data = await resp.json();
+      return data.url || null;
+    } catch (e) {
+      console.error('[VideoCall] Upload failed:', e);
+      return null;
+    }
+  }
+
+  // ── ASR 转写 ──
+  async function _transcribeAudio(audioBlob) {
+    try {
+      const form = new FormData();
+      form.append('file', audioBlob, 'vc_audio.wav');
+      const resp = await fetch('/api/voice/transcribe', { method: 'POST', body: form });
+      const data = await resp.json();
+      const text = (data.text || '').trim();
+      console.log(`[VideoCall] ASR: "${text}"`);
+      return text;
+    } catch (e) {
+      console.error('[VideoCall] Transcribe error:', e);
+      return '';
+    }
+  }
+
+  // ── 从原生 PCM 帧构建 WAV ──
+  function _buildWavFromNativeChunks(chunks) {
+    const totalSamples = chunks.reduce((s, b64) => s + atob(b64).length / 2, 0);
+    const buf = new ArrayBuffer(44 + totalSamples * 2);
+    const v = new DataView(buf);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    const sr = 16000;
+    w(0, 'RIFF');
+    v.setUint32(4, 36 + totalSamples * 2, true);
+    w(8, 'WAVE'); w(12, 'fmt ');
+    v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, 'data');
+    v.setUint32(40, totalSamples * 2, true);
+    let off = 44;
+    for (const b64 of chunks) {
+      const bin = atob(b64);
+      for (let i = 0; i < bin.length; i++) {
+        v.setUint8(off++, bin.charCodeAt(i));
+      }
+    }
+    return new Blob([buf], { type: 'audio/wav' });
+  }
+
+  // ── 不活跃超时 ──
+  function _resetInactivityTimer() {
+    _lastInteractionTime = Date.now();
+    if (_inactivityTimer) clearTimeout(_inactivityTimer);
+    _inactivityTimer = setTimeout(() => {
+      if (_active && !_videoRecording && !_processing && !_aiSpeaking) {
+        console.log('[VideoCall] Inactivity timeout, hanging up');
+        _hangup();
+      }
+    }, 120000); // 2 分钟不活跃自动挂断
+  }
+
+  // ── Android 原生桥推送音频帧（录制期间收集用于 ASR） ──
+  function _onNativeChunk(b64) {
+    if (_videoRecording) {
+      _nativeAudioFrames.push(b64);
+    }
+  }
+
+  async function _sendToChat(text, videoAtt) {
     const convId = _convId || currentConvId;
     if (!convId) return;
 
     // 构建附件
     const attachments = [];
-    if (screenshotDataUrl) {
-      // 先上传截图
-      try {
-        const blob = await (await fetch(screenshotDataUrl)).blob();
-        const form = new FormData();
-        form.append('file', blob, `videocall_${Date.now()}.jpg`);
-        const resp = await fetch('/api/upload', { method: 'POST', body: form });
-        const data = await resp.json();
-        if (data.url) attachments.push(data.url);
-      } catch (e) {
-        console.error('[VideoCall] Upload screenshot failed:', e);
-      }
-    }
+    if (videoAtt) attachments.push(videoAtt);
 
-    // 等待上一条消息发完（最多等 10 秒，不放弃）
+    // 等待上一条消息发完（最多等 10 秒）
     if (typeof sending !== 'undefined' && sending) {
       let waited = 0;
       while (sending && waited < 10000) {
@@ -663,11 +876,10 @@ const videoCall = (() => {
       }
     }
 
-    // 通过 API 发送消息（独立 fetch，不依赖全局 send()）
     try {
       const contextLimit = parseInt(document.getElementById('contextSlider')?.value) || 30;
       const body = {
-        content: text,
+        content: text || '',
         context_limit: contextLimit,
         attachments,
         whisper_mode: false,
@@ -683,7 +895,6 @@ const videoCall = (() => {
         body: JSON.stringify(body)
       });
 
-      // 消耗 SSE 流（消息会通过 WS 广播到 chat.html）
       const reader = res.body.getReader();
       while (true) {
         const { done } = await reader.read();
@@ -692,8 +903,6 @@ const videoCall = (() => {
     } catch (e) {
       console.error('[VideoCall] Send failed:', e);
     }
-
-    // AI 回复会通过 TTS 播放，播完后 tts_done 会触发恢复
   }
 
   // ── 通知 AI 说话状态（被 chat.html 的 TTS 系统调用） ──
@@ -701,26 +910,56 @@ const videoCall = (() => {
     if (!_active) return;
     _aiSpeaking = speaking;
     if (!speaking) {
-      _resetVAD();
       _processing = false;
-      _updateStatus('聆听中...');
+      _setRecordBtnDisabled(false);
+      _updateStatus('等待录制...');
+      _resetInactivityTimer();
     } else {
+      _setRecordBtnDisabled(true);
       _updateStatus('AI 说话中...');
     }
   }
 
   // ── 挂断 ──
   function _hangup() {
+    const wasActive = _active;
+    const callDuration = _callStartTime > 0 ? Math.floor((Date.now() - _callStartTime) / 1000) : 0;
+    const convId = _convId || currentConvId;
+
     _active = false;
     _ringing = false;
+    _callStartTime = 0;
+
+    // 取消正在进行的录制
+    if (_videoRecording) {
+      _videoRecording = false;
+      _clearRecordUI();
+      if (_useNativeCamera && window.AionVideo) window.AionVideo.cancel();
+      if (_videoRecorder && _videoRecorder.state !== 'inactive') _videoRecorder.stop();
+      if (_audioForASR && _audioForASR.state !== 'inactive') _audioForASR.stop();
+      _videoRecorder = null;
+      _audioForASR = null;
+    }
+
+    if (_inactivityTimer) { clearTimeout(_inactivityTimer); _inactivityTimer = null; }
+
     _stopRingbell();
     _stopCamera();
-    _stopVoiceListening();
+    _stopAudioStream();
     _removeOverlay();
 
     // 播放挂断音
     const audio = new Audio('/public/挂断音.mp3');
     audio.play().catch(() => {});
+
+    // 通话结束后插入系统消息（仅实际接通过的通话）
+    if (wasActive && convId && callDuration > 0) {
+      fetch('/api/video-call-sys-msg', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conv_id: convId, duration: callDuration })
+      }).catch(e => console.error('[VideoCall] sys msg failed:', e));
+    }
   }
 
   function _removeOverlay() {
@@ -769,32 +1008,6 @@ const videoCall = (() => {
     if (el) el.textContent = text;
   }
 
-  // ── WAV 编码 ──
-  function _encodeWAV(samples) {
-    const sr = _sampleRate;
-    const buf = new ArrayBuffer(44 + samples.length * 2);
-    const v = new DataView(buf);
-    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-    w(0, 'RIFF');
-    v.setUint32(4, 36 + samples.length * 2, true);
-    w(8, 'WAVE');
-    w(12, 'fmt ');
-    v.setUint32(16, 16, true);
-    v.setUint16(20, 1, true);
-    v.setUint16(22, 1, true);
-    v.setUint32(24, sr, true);
-    v.setUint32(28, sr * 2, true);
-    v.setUint16(32, 2, true);
-    v.setUint16(34, 16, true);
-    w(36, 'data');
-    v.setUint32(40, samples.length * 2, true);
-    for (let i = 0; i < samples.length; i++) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-    }
-    return buf;
-  }
-
   // ═══════════════════════════════════════════
   // 公开 API
   // ═══════════════════════════════════════════
@@ -805,6 +1018,15 @@ const videoCall = (() => {
   function userInitiate() {
     if (_active || _ringing) return;
     _convId = currentConvId;
+
+    // 插入「你拨打了视频电话」系统消息
+    if (_convId) {
+      fetch('/api/video-call-init-sys-msg', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conv_id: _convId })
+      }).catch(e => console.error('[VideoCall] init sys msg failed:', e));
+    }
 
     // 显示来电界面（模拟 AI 接听等待 3 秒）
     _ringing = true;
@@ -893,9 +1115,15 @@ const videoCall = (() => {
       Promise.all([minDelay, audioEnd]).then(resolve);
     });
 
-    // 现在才启动语音侦听
+    // 记录通话开始时间
+    _callStartTime = Date.now();
+
+    // 启动音频流 + 初始化录制按钮
     if (_active) {
-      _startVoiceListening();
+      _startAudioStream();
+      _initRecordButton();
+      _updateStatus('等待录制...');
+      _resetInactivityTimer();
     }
   }
 
@@ -938,6 +1166,9 @@ const videoCall = (() => {
 
       msgEl.after(indicator);
 
+      // 插入指示器后滚动到底部，确保用户能看到
+      if (typeof scrollBottom === 'function') scrollBottom();
+
       // 5 秒后自动移除（3秒延迟后弹出来电UI时指示器应已消失）
       setTimeout(() => {
         const el = document.getElementById('vc_incoming_indicator');
@@ -947,12 +1178,11 @@ const videoCall = (() => {
   }
 
   // ── 暴露给 Android 原生桥接的方法 ──
-  // window.AionAudio 会调用 window.onAionAudioChunk(b64)
-  // 视频通话模式下拦截原生音频帧
   const _origChunkHandler = window.onAionAudioChunk;
   window.onAionAudioChunk = function(b64) {
-    if (_active && _useNativeAudio) {
+    if (_active) {
       _onNativeChunk(b64);
+      // 同时仍然推给 videoCall 的回调（如果需要）
     } else if (_origChunkHandler) {
       _origChunkHandler(b64);
     } else if (typeof remoteVoice !== 'undefined') {

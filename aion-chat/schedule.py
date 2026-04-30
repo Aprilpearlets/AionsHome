@@ -324,43 +324,25 @@ class ScheduleManager:
             await db.commit()
         await manager.broadcast({"type": "schedule_changed"})
 
-        # 检查摄像头是否开启
+        # 尝试截图（摄像头可能未开启）
         from camera import cam
-        if not cam.running:
-            # 摄像头未开启，插入系统消息并返回
-            async with get_db() as db:
-                db.row_factory = aiosqlite.Row
-                cur = await db.execute("SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 1")
-                conv = await cur.fetchone()
-            if conv:
-                await _sys_msg(conv["id"], f"👁 定时监控触发失败：摄像头未开启（原计划：{content}）")
-            return
+        fname = None
+        if cam.running:
+            # 播放提示音 + 5秒延迟，给用户反应时间
+            await manager.broadcast({"type": "monitor_alert", "data": {"content": content}})
+            await asyncio.sleep(5)
 
-        # 播放提示音 + 5秒延迟，给用户反应时间
-        await manager.broadcast({"type": "monitor_alert", "data": {"content": content}})
-        await asyncio.sleep(5)
+            jpg_bytes = cam.get_frame_jpeg()
+            if jpg_bytes:
+                from config import UPLOADS_DIR, SCREENSHOTS_DIR
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                fname = f"monitor_{ts}.jpg"
+                fpath = UPLOADS_DIR / fname
+                fpath.write_bytes(jpg_bytes)
 
-        # 截图
-        jpg_bytes = cam.get_frame_jpeg()
-        if not jpg_bytes:
-            async with get_db() as db:
-                db.row_factory = aiosqlite.Row
-                cur = await db.execute("SELECT * FROM conversations ORDER BY updated_at DESC LIMIT 1")
-                conv = await cur.fetchone()
-            if conv:
-                await _sys_msg(conv["id"], f"👁 定时监控触发失败：无法获取摄像头画面（原计划：{content}）")
-            return
-
-        # 保存截图到 uploads
-        from config import UPLOADS_DIR, SCREENSHOTS_DIR
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        fname = f"monitor_{ts}.jpg"
-        fpath = UPLOADS_DIR / fname
-        fpath.write_bytes(jpg_bytes)
-
-        # 同时保存到 screenshots 目录
-        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-        (SCREENSHOTS_DIR / fname).write_bytes(jpg_bytes)
+                # 同时保存到 screenshots 目录
+                SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+                (SCREENSHOTS_DIR / fname).write_bytes(jpg_bytes)
 
         # 获取最新对话
         wb = load_worldbook()
@@ -424,31 +406,38 @@ class ScheduleManager:
         history.insert(cap_idx, {"role": "user", "content": ability_block})
         history.insert(cap_idx + 1, {"role": "assistant", "content": "好的，需要时我会使用这些指令。"})
 
-        # 获取最近 2 小时的设备活动摘要（12 条）
+        # 获取最近 1 小时的设备活动摘要（6 条）
         activity_summary_text = ""
         try:
             from activity import get_activity_summary_for_prompt
-            activity_summary_text = get_activity_summary_for_prompt(12)
+            activity_summary_text = get_activity_summary_for_prompt(6)
         except Exception:
             pass
 
-        # 触发提示词（带截图）
+        # 触发提示词
         trigger_prompt = (
             f"[定时监控触发]\n"
             f"你之前设置了在 {trigger_at.replace('T', ' ')} 查看【{user_name}】的状态。\n"
             f"监控目的：{content}\n"
-            f"这是系统在当前时间（{now_str}）自动从摄像头截取的实时画面。\n"
         )
+        if fname:
+            trigger_prompt += f"这是系统在当前时间（{now_str}）自动从摄像头截取的实时画面。\n"
+        else:
+            trigger_prompt += f"当前时间是{now_str}，摄像头未开启，无法获取画面。\n"
         if activity_summary_text:
             trigger_prompt += (
-                f"\n以下是{user_name}过去两小时的设备使用动态（手机/电脑应用使用情况，每10分钟一条摘要）：\n"
+                f"\n以下是{user_name}过去一小时的设备使用动态（手机/电脑应用使用情况，每10分钟一条摘要）：\n"
                 f"{activity_summary_text}\n"
             )
-        trigger_prompt += f"\n请根据画面内容、设备活动动态和之前的对话上下文，自然地回应。"
+        if fname:
+            trigger_prompt += f"\n请根据画面内容、设备活动动态和之前的对话上下文，自然地回应。"
+        else:
+            trigger_prompt += f"\n请根据设备活动动态和之前的对话上下文，自然地回应。"
 
-        messages = prefix + history + [
-            {"role": "user", "content": trigger_prompt, "attachments": [f"/uploads/{fname}"]}
-        ]
+        trigger_msg = {"role": "user", "content": trigger_prompt}
+        if fname:
+            trigger_msg["attachments"] = [f"/uploads/{fname}"]
+        messages = prefix + history + [trigger_msg]
 
         # 预生成 ai_msg_id（TTS 分段文件命名需要）
         ai_msg_id = f"msg_{int(time.time()*1000)}_sm"

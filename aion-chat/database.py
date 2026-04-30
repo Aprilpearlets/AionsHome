@@ -32,6 +32,10 @@ async def init_db():
             await db.execute("ALTER TABLE messages ADD COLUMN attachments TEXT DEFAULT ''")
         except:
             pass
+        try:
+            await db.execute("ALTER TABLE messages ADD COLUMN starred INTEGER DEFAULT 0")
+        except:
+            pass
         # 性能索引
         await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv_id ON messages(conv_id, created_at)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at DESC)")
@@ -166,6 +170,21 @@ async def init_db():
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_gifts_status ON gifts(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_gifts_created ON gifts(created_at DESC)")
+        # ── 基金持仓表 ──
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fund_holdings (
+                id TEXT PRIMARY KEY,
+                fund_code TEXT NOT NULL,
+                fund_name TEXT DEFAULT '',
+                shares REAL DEFAULT 0,
+                avg_cost REAL DEFAULT 0,
+                total_cost REAL DEFAULT 0,
+                warn_down REAL DEFAULT -3.0,
+                warn_up REAL DEFAULT 15.0,
+                created_at REAL NOT NULL
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_fund_holdings_code ON fund_holdings(fund_code)")
         await db.commit()
 
 

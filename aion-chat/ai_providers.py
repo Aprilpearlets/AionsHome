@@ -62,7 +62,7 @@ def build_gemini_contents(history: list):
 
 
 # ── 硅基流动 ──────────────────────────────────────
-async def call_siliconflow(messages: list, model: str, meta: dict | None = None, temperature: float | None = None):
+async def call_siliconflow(messages: list, model: str, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None):
     url = "https://api.siliconflow.cn/v1/chat/completions"
     headers = {"Authorization": f"Bearer {get_key('siliconflow')}", "Content-Type": "application/json"}
     api_messages = build_multimodal_messages(messages)
@@ -70,6 +70,8 @@ async def call_siliconflow(messages: list, model: str, meta: dict | None = None,
                "stream_options": {"include_usage": True}}
     if temperature is not None:
         payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
             if resp.status_code != 200:
@@ -101,12 +103,17 @@ async def call_siliconflow(messages: list, model: str, meta: dict | None = None,
 
 
 # ── Gemini ────────────────────────────────────────
-async def call_gemini(messages: list, model: str, meta: dict | None = None, temperature: float | None = None):
+async def call_gemini(messages: list, model: str, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={get_key('gemini')}"
     contents = build_gemini_contents(messages)
     payload = {"contents": contents}
+    gen_config = {}
     if temperature is not None:
-        payload["generationConfig"] = {"temperature": temperature}
+        gen_config["temperature"] = temperature
+    if max_tokens is not None:
+        gen_config["maxOutputTokens"] = max_tokens
+    if gen_config:
+        payload["generationConfig"] = gen_config
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", url, json=payload) as resp:
             if resp.status_code != 200:
@@ -133,14 +140,16 @@ async def call_gemini(messages: list, model: str, meta: dict | None = None, temp
                     except:
                         pass
 
-# ── AiPro 中转站 ────────────────────────────────────────
-async def call_aipro(messages: list, model: str, meta: dict | None = None, temperature: float | None = None):
-    url = "https://vip.aipro.love/v1/chat/completions"
+# ── AiPro 中转站 ────────────────────────────────────────https://vip.aipro.love
+async def call_aipro(messages: list, model: str, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None):
+    url = "https://vip.aipro.love/v1/chat/completions"	
     headers = {"Authorization": f"Bearer {get_key('aipro')}", "Content-Type": "application/json"}
     api_messages = build_multimodal_messages(messages)
     payload = {"model": model, "messages": api_messages, "stream": True}
     if temperature is not None:
         payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
             if resp.status_code != 200:
@@ -180,7 +189,7 @@ async def simple_ai_call(messages: list, model_key: str, temperature: float | No
 
 
 # ── 统一调度 ──────────────────────────────────────
-async def stream_ai(messages: list, model_key: str, meta: dict | None = None, temperature: float | None = None):
+async def stream_ai(messages: list, model_key: str, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None, cancel_event=None):
     normalized = []
     for m in messages:
         nm = dict(m)
@@ -194,11 +203,17 @@ async def stream_ai(messages: list, model_key: str, meta: dict | None = None, te
         yield f"[错误] 未知模型: {model_key}"
         return
     if cfg["provider"] == "siliconflow":
-        async for chunk in call_siliconflow(normalized, cfg["model"], meta, temperature):
+        async for chunk in call_siliconflow(normalized, cfg["model"], meta, temperature, max_tokens):
+            if cancel_event and cancel_event.is_set():
+                return
             yield chunk
     elif cfg["provider"] == "gemini":
-        async for chunk in call_gemini(normalized, cfg["model"], meta, temperature):
+        async for chunk in call_gemini(normalized, cfg["model"], meta, temperature, max_tokens):
+            if cancel_event and cancel_event.is_set():
+                return
             yield chunk
     elif cfg["provider"] == "aipro":
-        async for chunk in call_aipro(normalized, cfg["model"], meta, temperature):
+        async for chunk in call_aipro(normalized, cfg["model"], meta, temperature, max_tokens):
+            if cancel_event and cancel_event.is_set():
+                return
             yield chunk
