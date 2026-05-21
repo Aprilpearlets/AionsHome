@@ -80,15 +80,26 @@ if "%NEED_VENV%"=="1" (
 :: ────────────────────────────────────────
 echo.
 echo [4/5] 安装 Python 依赖包（首次可能需要几分钟）...
-.venv\Scripts\pip install -r aion-chat\requirements.txt -q
+if exist "vendor" (
+    echo    检测到 vendor 离线包，优先从本地安装...
+    .venv\Scripts\python -m pip install --no-index --find-links "%~dp0vendor" -r "%~dp0aion-chat\requirements.txt" -q
+    if errorlevel 1 (
+        echo.
+        echo    本地离线安装失败，改用「本地包 + 在线源」兜底...
+        .venv\Scripts\python -m pip install --find-links "%~dp0vendor" -r "%~dp0aion-chat\requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/ -q
+    )
+) else (
+    .venv\Scripts\python -m pip install -r "%~dp0aion-chat\requirements.txt" -q
+)
 if errorlevel 1 (
     echo.
     echo ❌ 依赖安装失败！
     echo.
     echo    常见原因及解决方法：
     echo.
-    echo    1. 网络问题 → 尝试使用国内镜像：
-    echo       .venv\Scripts\pip install -r aion-chat\requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+    echo    1. 如果项目里有 vendor 文件夹，请优先双击「离线安装环境.bat」
+    echo       或手动运行：
+    echo       .venv\Scripts\python -m pip install --no-index --find-links vendor -r aion-chat\requirements.txt
     echo.
     echo    2. 缺少 C++ 编译工具 → 如果报错包含 "Microsoft Visual C++ 14.0 or greater is required"：
     echo       请下载安装 Microsoft C++ Build Tools：
@@ -112,6 +123,7 @@ echo [5/5] 检查安装结果...
 .venv\Scripts\python -c "import psutil; print('    psutil ', psutil.__version__)"
 .venv\Scripts\python -c "import ebooklib; print('    ebooklib OK')"
 .venv\Scripts\python -c "import bs4; print('    BeautifulSoup4 OK')"
+.venv\Scripts\python -c "import mcp; print('    MCP SDK ', mcp.__version__)"
 
 echo.
 echo ========================================

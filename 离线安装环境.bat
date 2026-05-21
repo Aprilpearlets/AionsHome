@@ -1,4 +1,5 @@
 @echo off
+setlocal
 chcp 65001 >nul
 title Aion Chat 离线安装（无需联网）
 cd /d "%~dp0"
@@ -124,7 +125,7 @@ if not exist "vendor" (
     exit /b 1
 )
 
-.venv\Scripts\pip install --no-index --find-links vendor -r aion-chat\requirements.txt -q
+.venv\Scripts\python -m pip install --no-index --find-links "%~dp0vendor" -r "%~dp0aion-chat\requirements.txt" -q
 if errorlevel 1 (
     echo.
     echo    离线安装出错，正在尝试逐个安装...
@@ -136,7 +137,7 @@ if errorlevel 1 (
         lxml websockets pywin32 psutil akshare chinese-calendar
     ) do (
         echo    正在安装 %%p ...
-        .venv\Scripts\pip install --no-index --find-links vendor %%p -q 2>nul
+        .venv\Scripts\python -m pip install --no-index --find-links "%~dp0vendor" %%p -q 2>nul
         if errorlevel 1 (
             echo    [跳过] %%p 安装失败，可能缺少对应 Python %PYVER% 的预编译包
         )

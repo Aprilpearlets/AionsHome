@@ -79,12 +79,22 @@ if "%NEED_VENV%"=="1" (
 :: ----------------------------------------
 echo.
 echo [4/5] Installing dependencies (may take a few minutes) ...
-echo    Trying Aliyun mirror first for speed ...
-.venv\Scripts\pip install -r aion-chat\requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ -q
-if errorlevel 1 (
-    echo.
-    echo    Mirror failed, retrying with default PyPI ...
-    .venv\Scripts\pip install -r aion-chat\requirements.txt -q
+if exist "vendor" (
+    echo    Local vendor packages found; trying offline install first ...
+    .venv\Scripts\python -m pip install --no-index --find-links "%~dp0vendor" -r "%~dp0aion-chat\requirements.txt" -q
+    if errorlevel 1 (
+        echo.
+        echo    Offline install failed, retrying with local packages plus Aliyun mirror ...
+        .venv\Scripts\python -m pip install --find-links "%~dp0vendor" -r "%~dp0aion-chat\requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/ -q
+    )
+) else (
+    echo    Trying Aliyun mirror first for speed ...
+    .venv\Scripts\python -m pip install -r "%~dp0aion-chat\requirements.txt" -i https://mirrors.aliyun.com/pypi/simple/ -q
+    if errorlevel 1 (
+        echo.
+        echo    Mirror failed, retrying with default PyPI ...
+        .venv\Scripts\python -m pip install -r "%~dp0aion-chat\requirements.txt" -q
+    )
 )
 if errorlevel 1 (
     echo.
@@ -92,8 +102,8 @@ if errorlevel 1 (
     echo.
     echo    Common fixes:
     echo.
-    echo    1. Network issue - try manually:
-    echo       .venv\Scripts\pip install -r aion-chat\requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
+    echo    1. If this package includes a vendor folder, run offline install:
+    echo       .venv\Scripts\python -m pip install --no-index --find-links vendor -r aion-chat\requirements.txt
     echo.
     echo    2. If you see "Microsoft Visual C++ 14.0 or greater is required":
     echo       Download and install Microsoft C++ Build Tools:
